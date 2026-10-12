@@ -14,6 +14,7 @@ import (
 )
 
 type proxyRequest struct {
+	AcceptTerms     bool         `json:"accept_terms"`
 	Name            string       `json:"name"`
 	Kind            db.ProxyKind `json:"kind"`
 	Protocol        string       `json:"protocol"`
@@ -38,7 +39,7 @@ func (s *Server) listProxies(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]*ProxyDTO, 0, len(items))
 	for _, item := range items {
-		out = append(out, proxyDTO(item))
+		out = append(out, s.runtimeProxyDTO(item))
 	}
 	global, _ := s.m.pg.GlobalProxyID()
 	writeJSON(w, 200, map[string]any{"proxies": out, "global_proxy_id": global})
@@ -51,12 +52,48 @@ func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := proxyFromRequest(req)
+	if p.Kind == db.ProxyKindWarp {
+		if !req.AcceptTerms {
+			writeErr(w, 400, "请先阅读并接受 Cloudflare WARP 条款")
+			return
+		}
+		if len(p.Name) > 80 || !p.Enabled {
+			writeErr(w, 400, "WARP 名称不能超过 80 字节，创建时必须启用")
+			return
+		}
+		if _, err := s.m.proxyRuntime(); err != nil {
+			writeErr(w, 503, "代理运行时未初始化")
+			return
+		}
+	}
 	created, err := s.m.pg.CreateProxy(p)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, 201, proxyDTO(created))
+	if created.Kind == db.ProxyKindWarp {
+		ready, err := s.performWarpAction(r.Context(), created.ID, "register", req.AcceptTerms)
+		if err != nil {
+			s.writeWarpFailure(w, created.ID, err)
+			return
+		}
+		created = ready
+	}
+	writeJSON(w, 201, s.runtimeProxyDTO(created))
+}
+
+func (s *Server) getProxy(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, 400, "invalid proxy id")
+		return
+	}
+	p, err := s.m.pg.GetProxy(id)
+	if err != nil {
+		writeErr(w, 404, "代理不存在")
+		return
+	}
+	writeJSON(w, 200, s.runtimeProxyDTO(p))
 }
 
 func (s *Server) updateProxy(w http.ResponseWriter, r *http.Request) {
@@ -77,7 +114,7 @@ func (s *Server) updateProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, 200, proxyDTO(updated))
+	writeJSON(w, 200, s.runtimeProxyDTO(updated))
 }
 
 func (s *Server) deleteProxy(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +165,13 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var probeErr error
-	if p.Kind == db.ProxyKindResin {
+	if p.Kind == db.ProxyKindWarp {
+		rt, runtimeErr := s.m.proxyRuntime()
+		probeErr = runtimeErr
+		if runtimeErr == nil {
+			_, probeErr = rt.warp.Probe(r.Context(), warpProfileID(id))
+		}
+	} else if p.Kind == db.ProxyKindResin {
 		probeErr = newResinAdapter().probe(r.Context(), p)
 	} else {
 		probeErr = egress.ProbeProxy(r.Context(), p.URL, "", p.Kind == db.ProxyKindWarp)
@@ -150,7 +193,7 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 502, message)
 		return
 	}
-	writeJSON(w, 200, proxyDTO(p))
+	writeJSON(w, 200, s.runtimeProxyDTO(p))
 }
 
 func (s *Server) setGlobalProxy(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +238,7 @@ func proxyFromRequest(req proxyRequest) *db.Proxy {
 
 // RegisterProxyActionRoutes 供共享路由装配调用；响应统一使用前端代理 DTO。
 func (s *Server) RegisterProxyActionRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/proxies/{id}", s.getProxy)
 	mux.HandleFunc("POST /api/proxies/{id}/warp/{action}", s.warpAction)
 	mux.HandleFunc("POST /api/proxies/{id}/resin/release", s.releaseResin)
 }

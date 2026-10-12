@@ -71,6 +71,8 @@ type TaskDTO struct {
 }
 
 type ProxyDTO struct {
+	WarpPhase          string       `json:"warp_phase,omitempty"`
+	EgressIP           string       `json:"egress_ip,omitempty"`
 	Protocol           string       `json:"protocol"`
 	HasPassword        bool         `json:"has_password"`
 	HasResinAdminToken bool         `json:"has_resin_admin_token"`
@@ -100,6 +102,44 @@ func proxyDTO(p *db.Proxy) *ProxyDTO {
 		}
 		return p.LastCheckedAt.Format(time.RFC3339)
 	}()}
+}
+
+// 运行态仅用于代理管理接口；任务历史快照不伪装为当前在线状态。
+func (s *Server) runtimeProxyDTO(p *db.Proxy) *ProxyDTO {
+	d := proxyDTO(p)
+	if p == nil || p.Kind != db.ProxyKindWarp {
+		return d
+	}
+	d.WarpPhase = "unregistered"
+	rt, err := s.m.proxyRuntime()
+	if err != nil {
+		d.Status, d.WarpPhase = db.ProxyStatusFailed, "failed"
+		return d
+	}
+	profile, err := rt.warp.Get(warpProfileID(p.ID))
+	if err != nil {
+		if p.Status == db.ProxyStatusHealthy || p.Status == db.ProxyStatusFailed {
+			d.Status, d.WarpPhase = db.ProxyStatusFailed, "failed"
+		}
+		return d
+	}
+	d.WarpPhase = profile.Phase
+	switch profile.Phase {
+	case "ready":
+		if p.Enabled && p.Status == db.ProxyStatusHealthy && profile.Desired {
+			d.EgressIP = profile.EgressIP
+		} else {
+			d.Status = db.ProxyStatusFailed
+		}
+	case "stopped":
+		d.Status = db.ProxyStatusStopped
+	default:
+		d.Status = db.ProxyStatusFailed
+	}
+	if profile.LastError != "" {
+		d.LastError = profile.LastError
+	}
+	return d
 }
 
 func proxyCredentialFlags(protocol, raw, password string) (string, bool) {
@@ -672,6 +712,8 @@ type LLMProfileDTO struct {
 	Format          string  `json:"format"`
 	BaseURL         string  `json:"base_url,omitempty"`
 	Proxy           string  `json:"proxy,omitempty"`
+	ProxyMode       string  `json:"proxy_mode"`
+	ProxyID         *string `json:"proxy_id"`
 	Model           string  `json:"model"`
 	APIKeyHint      string  `json:"api_key_hint,omitempty"`
 	RatePerSecond   float64 `json:"rate_per_second"`
@@ -701,12 +743,19 @@ type LLMProfileDTO struct {
 }
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
+	var proxyID *string
+	if p.ProxyID != nil {
+		id := i64s(*p.ProxyID)
+		proxyID = &id
+	}
 	return LLMProfileDTO{
 		ID:               i64s(p.ID),
 		Name:             p.Name,
 		Format:           p.Format,
 		BaseURL:          p.BaseURL,
-		Proxy:            p.Proxy,
+		Proxy:            maskProxyURL(p.Proxy),
+		ProxyMode:        p.ProxyMode,
+		ProxyID:          proxyID,
 		Model:            p.Model,
 		APIKeyHint:       p.APIKeyHint,
 		RatePerSecond:    p.RatePerSecond,

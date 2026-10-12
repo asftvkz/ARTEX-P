@@ -23,6 +23,8 @@ export interface ProxyRecord {
   status: "unknown" | "healthy" | "failed" | "starting" | "stopped" | string;
   last_error?: string;
   last_checked_at?: string;
+  warp_phase?: string;
+  egress_ip?: string;
 }
 
 export type ProxyWriteInput = {
@@ -40,6 +42,7 @@ export type ProxyWriteInput = {
   enabled?: boolean;
   clear_password?: boolean;
   clear_resin_admin_token?: boolean;
+  accept_terms?: true;
 };
 
 // 任务保存的是出口快照，不代表代理中心当前健康状态。
@@ -1091,6 +1094,9 @@ export interface LLMProfile {
   format: "openai" | "anthropic" | "openai-responses";
   base_url?: string;
   proxy?: string;
+  /** 新代理中心选择；legacy URL 行为空字符串/null。 */
+  proxy_mode?: "" | "inherit" | "direct" | "fixed";
+  proxy_id?: string | null;
   model: string;
   api_key_hint?: string;
   rate_per_second: number;

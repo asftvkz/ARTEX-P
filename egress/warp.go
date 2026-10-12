@@ -138,7 +138,33 @@ func (m *WarpManager) Get(id string) (WarpProfile, error) {
 	if err != nil {
 		return WarpProfile{}, err
 	}
-	return readProfile(path)
+	p, err := readProfile(path)
+	return m.liveProfileLocked(p), err
+}
+
+// 磁盘的 ready 只是上次探测结果；本进程没有活跃运行器时不能宣称在线。
+func (m *WarpManager) liveProfileLocked(p WarpProfile) WarpProfile {
+	if p.Phase != "ready" {
+		p.EgressIP = ""
+		return p
+	}
+	if !m.runningLocked(p.ID) || !p.Desired || net.ParseIP(p.EgressIP) == nil {
+		p.Phase, p.EgressIP, p.LastError = "failed", "", "WARP 运行器未在线或出口未验证"
+	}
+	return p
+}
+
+func (m *WarpManager) runningLocked(id string) bool {
+	proc := m.processes[id]
+	if proc == nil {
+		return false
+	}
+	select {
+	case <-proc.done:
+		return false
+	default:
+		return true
+	}
 }
 
 func (m *WarpManager) List() ([]WarpProfile, error) {
@@ -157,7 +183,7 @@ func (m *WarpManager) List() ([]WarpProfile, error) {
 		if err != nil {
 			return nil, err
 		}
-		list = append(list, p)
+		list = append(list, m.liveProfileLocked(p))
 	}
 	return list, nil
 }
@@ -340,6 +366,9 @@ func (m *WarpManager) Connection(id string) (WarpConnection, error) {
 	if p.Phase != "ready" || !p.Desired || p.EgressIP == "" {
 		return WarpConnection{}, errors.New("WARP 出口尚未验证可用")
 	}
+	if m.liveProfileLocked(p).Phase != "ready" {
+		return WarpConnection{}, errors.New("WARP 运行器未在线")
+	}
 	var auth warpAuth
 	if err := readAuth(path, &auth); err != nil {
 		return WarpConnection{}, err
@@ -349,6 +378,9 @@ func (m *WarpManager) Connection(id string) (WarpConnection, error) {
 
 func (m *WarpManager) startLocked(ctx context.Context, path string, p WarpProfile) (WarpProfile, error) {
 	if running := m.processes[p.ID]; running != nil {
+		if current := m.liveProfileLocked(p); current.Phase == "ready" {
+			return current, nil
+		}
 		return p, errors.New("WARP 出口已有运行进程")
 	}
 	p.Desired = true
@@ -474,6 +506,43 @@ func (m *WarpManager) Start(ctx context.Context, id string) (WarpProfile, error)
 		return p, errors.New("WARP 档案尚未完成创建，请恢复")
 	}
 	return m.startLocked(ctx, path, p)
+}
+
+// Probe 刷新当前出口 IP；停止、崩溃或失败的运行器不会仅凭旧地址恢复为 healthy。
+func (m *WarpManager) Probe(ctx context.Context, id string) (WarpProfile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, err := m.path(id)
+	if err != nil {
+		return WarpProfile{}, err
+	}
+	p, err := readProfile(path)
+	if err != nil {
+		return p, err
+	}
+	p = m.liveProfileLocked(p)
+	// 失败的探测不销毁仍在服务任务的进程；材料与进程有效即可原地复探。
+	if (p.Phase != "ready" && p.Phase != "failed") || !p.Desired || !p.Registered || !p.Generated || !m.runningLocked(id) {
+		return p, errors.New("WARP 出口尚未就绪")
+	}
+	var auth warpAuth
+	if err := readAuth(path, &auth); err != nil {
+		return p, err
+	}
+	ip, err := m.probe(ctx, WarpConnection{"127.0.0.1", p.Port, auth.Username, auth.Password})
+	if err != nil {
+		p.Phase, p.EgressIP, p.LastError = "failed", "", "WARP 联网检测失败"
+		// 健康探测不拥有生命周期准入权；停止仍须走管理端引用屏障。
+	} else {
+		p.Phase, p.EgressIP, p.LastError = "ready", ip, ""
+	}
+	if saveErr := m.save(path, p); saveErr != nil {
+		return p, saveErr
+	}
+	if err != nil {
+		return p, errors.New(p.LastError)
+	}
+	return p, nil
 }
 
 func (m *WarpManager) Resume(ctx context.Context, id string) (WarpProfile, error) {

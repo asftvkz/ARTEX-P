@@ -230,6 +230,57 @@ func (m *Manager) TaskToolProxy(ctx context.Context, t *Task) (addr, ca string, 
 	return addr, "", nil
 }
 
+// ResolveLLMProxySelection 只在可信运行边界解析渠道中心引用，不把凭据写回渠道。
+func (m *Manager) ResolveLLMProxySelection(ctx context.Context, t *Task, legacyURL, mode string, proxyID *int64) (string, error) {
+	if t != nil {
+		taskMode, err := db.NormalizeTaskProxyMode(t.ProxyMode)
+		if err != nil {
+			return "", err
+		}
+		if taskMode == db.TaskProxyModeDirect || taskMode == db.TaskProxyModeFixed {
+			return m.ResolveLLMProxy(ctx, t, "")
+		}
+	}
+	if mode != "fixed" && proxyID != nil {
+		return "", db.ErrProxyInvalidMode
+	}
+	switch mode {
+	case "":
+		return m.ResolveLLMProxy(ctx, t, legacyURL)
+	case "inherit":
+		return m.ResolveLLMProxy(ctx, t, "")
+	case "direct":
+		return "", nil
+	case "fixed":
+		if proxyID == nil || *proxyID <= 0 {
+			return "", db.ErrProxyIDRequired
+		}
+		p, err := m.pg.GetProxy(*proxyID)
+		if err != nil {
+			return "", db.ErrProxyUnavailable
+		}
+		if _, err := usableTaskProxy(p); err != nil {
+			return "", err
+		}
+		if p.Kind == db.ProxyKindResin {
+			// 渠道出口不能复用工具的单槽租约；独立回收合同完成前明确拒绝。
+			return "", errors.New("Resin 渠道引用需要独立租约生命周期，当前不支持")
+		}
+		snapshot, err := p.SnapshotEncrypted()
+		if err != nil {
+			return "", err
+		}
+		id := "llm"
+		if t != nil {
+			id = t.ID
+		}
+		selected := &Task{ID: id, ProxyMode: db.TaskProxyModeFixed, ProxyID: proxyID, ProxySnapshot: snapshot}
+		return m.ResolveLLMProxy(ctx, selected, "")
+	default:
+		return "", db.ErrProxyInvalidMode
+	}
+}
+
 // ResolveLLMProxy 固定/直连覆盖渠道；继承使用创建快照，非任务继承当前全局。
 func (m *Manager) ResolveLLMProxy(ctx context.Context, t *Task, channelProxy string) (string, error) {
 	if t != nil {

@@ -62,7 +62,8 @@ func TestLLMOuterAPIJWTSelectionsAndProfileOnlyModelList(t *testing.T) {
 	}))
 	defer proxy.Close()
 	id, set := executionModels(t, s, "http://model-list.invalid/v1")
-	if _, err := s.m.pg.Exec(`UPDATE llm_profiles SET proxy=$1 WHERE id=$2`, proxy.URL, id); err != nil {
+	// 此夹具模拟旧URL渠道；显式inherit按新合同会忽略旧URL。
+	if _, err := s.m.pg.Exec(`UPDATE llm_profiles SET proxy=$1,proxy_mode='',proxy_id=NULL WHERE id=$2`, proxy.URL, id); err != nil {
 		t.Fatal(err)
 	}
 	api := modelHTTPClient(t, s)

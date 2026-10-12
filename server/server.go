@@ -604,7 +604,11 @@ func (s *Server) providerForTaskSelection(selection db.LLMModelSelection, t *Tas
 	if !ok {
 		return nil, agent.Config{}, false
 	}
-	proxy, err := s.m.ResolveLLMProxy(firstContext(contexts), t, cfg.Proxy)
+	p, err := s.m.pg.ProfileByID(selection.ProfileID)
+	if err != nil || p == nil {
+		return nil, agent.Config{}, false
+	}
+	proxy, err := s.m.ResolveLLMProxySelection(firstContext(contexts), t, p.Proxy, p.ProxyMode, p.ProxyID)
 	if err != nil {
 		return nil, agent.Config{}, false
 	}
@@ -1471,22 +1475,62 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
-		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
-		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		llmProfileProxyRequest
+		Provider         string             `json:"provider"`
+		Model            string             `json:"model"`
+		BaseURL          string             `json:"base_url"`
+		APIKey           string             `json:"api_key"`
+		ThinkingType     string             `json:"thinking_type"`
+		ReasoningEffort  string             `json:"reasoning_effort"`
+		ProfileID        *llmModelRequestID `json:"profile_id"`         // 兼容字符串和旧整数。
+		Streaming        *bool              `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
+		SessionHeaderKey string             `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	var channel db.LLMProfile
+	if req.ProfileID != nil {
+		p, err := s.m.pg.ProfileByID(int64(*req.ProfileID))
+		if err != nil {
+			writeErr(w, 500, "读取渠道失败")
+			return
+		}
+		if p == nil {
+			writeErr(w, 404, "渠道不存在")
+			return
+		}
+		channel = *p
+		if req.Provider == "" {
+			req.Provider = p.Format
+		}
+		if req.Model == "" {
+			req.Model = p.Model
+		}
+		if req.BaseURL == "" {
+			req.BaseURL = p.BaseURL
+		}
+		if req.APIKey == "" {
+			req.APIKey = p.APIKey
+		}
+		if req.SessionHeaderKey == "" {
+			req.SessionHeaderKey = p.SessionHeaderKey
+		}
+		if req.Streaming == nil {
+			req.Streaming = &p.Streaming
+		}
+	}
+	if err := req.llmProfileProxyRequest.apply(&channel); err != nil {
+		writeErr(w, 400, "渠道代理选择无效")
+		return
+	}
+	proxy, err := s.m.ResolveLLMProxySelection(r.Context(), nil, channel.Proxy, channel.ProxyMode, channel.ProxyID)
+	if err != nil {
+		writeErr(w, 400, "代理解析失败")
+		return
+	}
+	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, proxy)
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType
@@ -1503,16 +1547,6 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if cfg.APIKey == "" {
-				cfg.APIKey = p.APIKey
-			}
-			if cfg.SessionHeaderKey == "" {
-				cfg.SessionHeaderKey = p.SessionHeaderKey
-			}
-		}
-	}
 	if cfg.APIKey == "" {
 		s.cfgMu.Lock()
 		cfg.APIKey = s.llmCfg.APIKey

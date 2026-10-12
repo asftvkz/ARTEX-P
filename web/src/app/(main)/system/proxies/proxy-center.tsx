@@ -25,9 +25,14 @@ import {
   proxyEndpoint as endpoint,
   proxyErrorText as errorText,
   type ProxyForm as Form,
+  proxyFromFailure,
   proxySelectable as selectable,
+  WARP_PHASE_LABEL,
   WARP_REGISTER_TERMS,
+  WARP_TERMS_URL,
   warpActionNeedsTerms,
+  warpAllowedActions,
+  warpReady,
 } from "@/lib/proxy-center";
 import type { ProxyKind, ProxyRecord } from "@/lib/types";
 
@@ -74,6 +79,10 @@ export function ProxyCenter() {
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState("");
   const [busy, setBusy] = React.useState("");
+  const mutationLock = React.useRef(false);
+  const [saveError, setSaveError] = React.useState("");
+  const [createUncertain, setCreateUncertain] = React.useState(false);
+  const [registrationUncertain, setRegistrationUncertain] = React.useState<number[]>([]);
   // WARP 注册条款确认：registering 记录待确认的代理编号；acceptTerms 必须由用户
   // 手动勾选（每次打开都重置为 false，绝不预选）。
   const [registering, setRegistering] = React.useState<number | null>(null);
@@ -105,11 +114,17 @@ export function ProxyCenter() {
     };
   }, []);
   const reset = () => {
+    if (mutationLock.current) return;
     setEditing(null);
     setForm(freshForm());
+    setSaveError("");
+    setCreateUncertain(false);
   };
   const edit = (item: ProxyRecord) => {
+    if (mutationLock.current) return;
     setEditing(item);
+    setSaveError("");
+    setCreateUncertain(false);
     setForm({
       name: item.name,
       kind: item.kind,
@@ -139,6 +154,7 @@ export function ProxyCenter() {
   }
 
   async function save() {
+    if (mutationLock.current || createUncertain) return;
     let data: ReturnType<typeof buildProxyPayload>;
     try {
       data = buildProxyPayload(form, !!editing);
@@ -146,16 +162,42 @@ export function ProxyCenter() {
       toast.error(errorText(error));
       return;
     }
+    mutationLock.current = true;
     setBusy("save");
+    setSaveError("");
     try {
-      if (editing) await api.updateProxy(editing.id, data);
-      else await api.createProxy(data);
-      toast.success(editing ? "代理配置已保存" : "代理已加入中心");
-      reset();
+      const result = editing ? await api.updateProxy(editing.id, data) : await api.createProxy(data);
+      if (!editing && form.kind === "warp" && !warpReady(result)) {
+        setEditing(result);
+        setSaveError(`WARP #${result.id} 已建档，但尚未连接成功。请核对状态并恢复该条目。`);
+      } else {
+        let message = "代理已加入中心";
+        if (editing) message = "代理配置已保存";
+        else if (form.kind === "warp") message = `WARP 已连接 · 出口 ${result.egress_ip}`;
+        toast.success(message);
+        setEditing(null);
+        setForm(freshForm());
+      }
       await refreshAfterMutation();
     } catch (error) {
-      toast.error(`保存失败：${errorText(error)}`);
+      const retained = proxyFromFailure(error);
+      if (retained) {
+        setEditing(retained);
+        setItems((prev) => [retained, ...prev.filter((item) => item.id !== retained.id)]);
+        setSaveError(`WARP #${retained.id} 已保留：${errorText(error)}。请恢复此条目，勿重复添加。`);
+      } else {
+        const status = (error as { status?: number }).status;
+        const uncertain = !editing && form.kind === "warp" && (!status || status >= 500);
+        setCreateUncertain(uncertain);
+        setSaveError(
+          uncertain
+            ? `添加结果不确定：${errorText(error)}。请刷新列表核对后编辑已有条目，不要重复提交。`
+            : `保存失败：${errorText(error)}`,
+        );
+      }
+      toast.error(errorText(error));
     } finally {
+      mutationLock.current = false;
       setBusy("");
     }
   }
@@ -192,23 +234,46 @@ export function ProxyCenter() {
   // 注册必须由用户先确认条款：只有确认后才会带着 accept_terms:true 调用；
   // start/stop/recover 不涉及条款，也不带请求体。
   async function warp(id: number, action: "register" | "start" | "stop" | "recover") {
+    if (mutationLock.current) return;
+    const current = items.find((item) => item.id === id) ?? (editing?.id === id ? editing : null);
+    if (
+      !current ||
+      !warpAllowedActions(current).includes(action) ||
+      (action === "register" && registrationUncertain.includes(id))
+    )
+      return;
     if (warpActionNeedsTerms(action) && acceptTerms !== true) return;
+    mutationLock.current = true;
+    if (action === "register") setRegistrationUncertain((prev) => [...prev, id]);
     setBusy(`warp:${id}`);
     try {
       const result = await api.proxyWarpAction(id, action, warpActionNeedsTerms(action) ? true : undefined);
+      setItems((prev) => prev.map((item) => (item.id === id ? result : item)));
+      if (editing?.id === id) setEditing(result);
       await refreshAfterMutation();
-      toast.info(`WARP #${id} 操作已返回，当前状态：${STATUS[result.status] ?? result.status}`);
+      if (warpReady(result)) {
+        toast.success(`WARP #${id} 已连接 · 出口 ${result.egress_ip}`);
+        if (editing?.id === id) setSaveError("");
+      } else toast.info(`WARP #${id} 当前状态：${WARP_PHASE_LABEL[result.warp_phase ?? ""] ?? "状态待核对"}`);
       setRegistering(null);
       setAcceptTerms(false);
     } catch (error) {
+      const retained = proxyFromFailure(error);
+      if (retained) {
+        setItems((prev) => prev.map((item) => (item.id === id ? retained : item)));
+        if (editing?.id === id) setEditing(retained);
+      }
       try {
         await reload();
       } catch {
         /* 保留操作错误 */
       }
       toast.error(`WARP #${id} 操作失败：${errorText(error)}`);
-      // 失败时保留确认框与勾选，用户可直接重试，无需重新确认条款。
+      // 注册失败或响应丢失均不重注册；后续仅按服务端 phase 恢复原 ID。
+      setRegistering(null);
+      setAcceptTerms(false);
     } finally {
+      mutationLock.current = false;
       setBusy("");
     }
   }
@@ -242,8 +307,10 @@ export function ProxyCenter() {
 
   const global = items.find((item) => item.id === globalID);
   let saveLabel = "添加代理";
+  if (!editing && form.kind === "warp") saveLabel = "确认添加（同意条款）";
   if (editing) saveLabel = "保存修改";
   if (busy === "save") saveLabel = "保存中…";
+  if (busy === "save" && form.kind === "warp" && !editing) saveLabel = "正在添加 / 连接…";
   let globalLabel = "直连";
   if (globalID) globalLabel = `#${globalID}（记录未返回）`;
   if (global) globalLabel = `#${global.id} ${global.name}`;
@@ -259,12 +326,21 @@ export function ProxyCenter() {
       <Card>
         <CardHeader>
           <CardTitle>{editing ? `编辑代理 #${editing.id}` : "新增代理"}</CardTitle>
-          <CardDescription>凭据不回显；编辑时秘密字段留空表示保留，勾选清除才会删除。</CardDescription>
+          <CardDescription>
+            {form.kind === "warp"
+              ? "输入名称并确认添加，系统自动注册、启动和验证出口。"
+              : "凭据不回显；编辑时秘密字段留空表示保留，勾选清除才会删除。"}
+          </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-2">
           <div className="grid gap-2">
             <Label htmlFor="proxy-name">名称</Label>
-            <Input id="proxy-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+            <Input
+              id="proxy-name"
+              disabled={!!busy || createUncertain}
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+            />
           </div>
           <div className="grid gap-2">
             <Label htmlFor="proxy-kind">类型</Label>
@@ -272,7 +348,7 @@ export function ProxyCenter() {
               id="proxy-kind"
               className="h-10 rounded-md border border-input bg-background px-3 text-sm"
               value={form.kind}
-              disabled={!!editing}
+              disabled={!!editing || !!busy || createUncertain}
               onChange={(e) => setForm({ ...form, kind: e.target.value as ProxyKind })}
             >
               {KINDS.map((kind) => (
@@ -316,9 +392,23 @@ export function ProxyCenter() {
             </div>
           )}
           {form.kind === "warp" && (
-            <p className="text-muted-foreground text-sm md:col-span-2">
-              创建后在列表中注册、启动和恢复。轻量 WARP 只提供本机 SOCKS5 出口，不修改宿主机默认路由。
-            </p>
+            <div className="space-y-2 text-muted-foreground text-sm md:col-span-2">
+              {!editing && (
+                <p>
+                  点击“确认添加”表示同意{" "}
+                  <a href={WARP_TERMS_URL} target="_blank" rel="noreferrer" className="underline">
+                    Cloudflare WARP 服务条款
+                  </a>
+                  ，并申请注册。轻量 WARP 提供本机 SOCKS5 出口。
+                </p>
+              )}
+              {editing && (
+                <p>
+                  代理 #{editing.id} · {WARP_PHASE_LABEL[editing.warp_phase ?? ""] ?? "状态待核对"} · 出口 IP：
+                  {warpReady(editing) ? editing.egress_ip : "未验证"}
+                </p>
+              )}
+            </div>
           )}
           {form.kind === "resin" && (
             <>
@@ -413,18 +503,30 @@ export function ProxyCenter() {
               </div>
             </>
           )}
-          <div className="flex items-center gap-3 md:col-span-2">
-            <Switch
-              id="proxy-enabled"
-              checked={form.enabled}
-              onCheckedChange={(enabled) => setForm({ ...form, enabled })}
-            />
-            <Label htmlFor="proxy-enabled">启用此代理</Label>
-          </div>
+          {(form.kind !== "warp" || editing) && (
+            <div className="flex items-center gap-3 md:col-span-2">
+              <Switch
+                id="proxy-enabled"
+                checked={form.enabled}
+                onCheckedChange={(enabled) => setForm({ ...form, enabled })}
+              />
+              <Label htmlFor="proxy-enabled">启用此代理</Label>
+            </div>
+          )}
+          {saveError && (
+            <p role="alert" className="text-destructive text-sm md:col-span-2">
+              {saveError}
+            </p>
+          )}
           <div className="flex gap-2 md:col-span-2">
-            <Button disabled={!!busy} onClick={() => void save()}>
+            <Button disabled={!!busy || createUncertain} onClick={() => void save()}>
               {saveLabel}
             </Button>
+            {editing?.kind === "warp" && warpAllowedActions(editing).includes("recover") && (
+              <Button variant="outline" disabled={!!busy} onClick={() => void warp(editing.id, "recover")}>
+                恢复此出口 #{editing.id}
+              </Button>
+            )}
             {editing && (
               <Button variant="outline" disabled={!!busy} onClick={reset}>
                 取消编辑
@@ -526,13 +628,18 @@ export function ProxyCenter() {
                 </div>
                 {item.kind === "warp" && (
                   <div className="flex flex-wrap gap-2 border-t pt-2">
-                    {(["register", "start", "stop", "recover"] as const).map((action) => (
+                    <p className="w-full text-muted-foreground text-xs">
+                      {WARP_PHASE_LABEL[item.warp_phase ?? ""] ?? "状态待核对"} · 出口 IP：
+                      {warpReady(item) ? item.egress_ip : "未验证"}
+                    </p>
+                    {warpAllowedActions(item).map((action) => (
                       <Button
                         key={action}
                         size="sm"
                         variant="outline"
                         disabled={
                           !!busy ||
+                          (action === "register" && registrationUncertain.includes(item.id)) ||
                           (action === "start" && item.status === "healthy") ||
                           (action === "stop" && item.status === "stopped")
                         }
@@ -549,6 +656,11 @@ export function ProxyCenter() {
                         {{ register: "注册", start: "启动", stop: "停止", recover: "恢复" }[action]}
                       </Button>
                     ))}
+                    {(item.warp_phase === "registering" || registrationUncertain.includes(item.id)) && (
+                      <p className="text-muted-foreground text-xs">
+                        注册结果可能不确定，请核对原条目；不会自动重复注册。
+                      </p>
+                    )}
                   </div>
                 )}
                 {item.kind === "resin" && (
@@ -567,6 +679,7 @@ export function ProxyCenter() {
       <Dialog
         open={registering !== null}
         onOpenChange={(open) => {
+          if (mutationLock.current) return;
           if (!open) {
             setRegistering(null);
             setAcceptTerms(false);
@@ -583,6 +696,9 @@ export function ProxyCenter() {
               <li key={line}>{line}</li>
             ))}
           </ul>
+          <a href={WARP_TERMS_URL} target="_blank" rel="noreferrer" className="text-sm underline">
+            Cloudflare WARP 官方服务条款
+          </a>
           <Label htmlFor="warp-accept-terms" className="flex items-start gap-2 font-normal text-sm">
             <Checkbox
               id="warp-accept-terms"
@@ -595,6 +711,7 @@ export function ProxyCenter() {
             <Button
               type="button"
               variant="outline"
+              disabled={!!busy}
               onClick={() => {
                 setRegistering(null);
                 setAcceptTerms(false);

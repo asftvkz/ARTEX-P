@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { LLMProxySelect } from "@/components/llm-proxy-select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -25,9 +26,11 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import { modelOptionLabel } from "@/lib/llm-selection";
 import { type ModelRow, resolveApiKeyToSend, rowsFromResponse, saveChannelWithModels } from "@/lib/llm-models";
-import type { LLMModel, LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import { type LLMProxyDraft, llmProxyDraft, llmProxyLabel, llmProxyRequest } from "@/lib/llm-proxy";
+import { modelOptionLabel } from "@/lib/llm-selection";
+import { proxyErrorText } from "@/lib/proxy-center";
+import type { LLMModel, LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride, ProxyRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ModelsEditor } from "./_components/models";
@@ -109,6 +112,7 @@ function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
 function PoolRouteRow({ member, onChanged }: { member: LLMPoolMember; onChanged: () => void }) {
   const [models, setModels] = React.useState<LLMModel[] | null>(null);
   const [saving, setSaving] = React.useState(false);
+
   const value = member.model_mode === "fixed-model" && member.model_id ? member.model_id : "channel-default";
 
   React.useEffect(() => {
@@ -380,6 +384,11 @@ function ProfileSheet({
   const [createdProfileId, setCreatedProfileId] = React.useState<number | null>(null);
   const [baseUrl, setBaseUrl] = React.useState("");
   const [proxy, setProxy] = React.useState("");
+  const [proxyDraft, setProxyDraft] = React.useState<LLMProxyDraft>({ mode: "inherit", id: "", changed: true });
+  const [proxyItems, setProxyItems] = React.useState<ProxyRecord[]>([]);
+  const [proxyLoading, setProxyLoading] = React.useState(false);
+  const [proxyLoadError, setProxyLoadError] = React.useState("");
+  const proxyLoadVersion = React.useRef(0);
   const [apiKey, setApiKey] = React.useState("");
   const [replaceApiKey, setReplaceApiKey] = React.useState(false);
   const [keyHint, setKeyHint] = React.useState("");
@@ -398,6 +407,20 @@ function ProfileSheet({
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
 
+  const loadProxies = React.useCallback(async () => {
+    const version = ++proxyLoadVersion.current;
+    setProxyLoading(true);
+    setProxyLoadError("");
+    try {
+      const r = await api.proxies();
+      if (version === proxyLoadVersion.current) setProxyItems(r.proxies ?? []);
+    } catch (e) {
+      if (version === proxyLoadVersion.current) setProxyLoadError(proxyErrorText(e));
+    } finally {
+      if (version === proxyLoadVersion.current) setProxyLoading(false);
+    }
+  }, []);
+
   // 每次打开时从传入的 profile 灌一遍表单（新建则重置为默认值）。抽屉关掉再打开
   // 就是一次干净的开始，不会留下上一个配置的残影。
   React.useEffect(() => {
@@ -406,6 +429,7 @@ function ProfileSheet({
     setFormat(profile?.format === "openai" || profile?.format === "openai-responses" ? profile.format : "anthropic");
     setBaseUrl(profile?.base_url ?? "");
     setProxy(profile?.proxy ?? "");
+    setProxyDraft(llmProxyDraft(profile));
     setRps(String(profile?.rate_per_second ?? 0));
     setRpm(String(profile?.rate_per_minute ?? 0));
     setCw(String(profile?.context_window_k ?? 0));
@@ -437,7 +461,11 @@ function ProfileSheet({
         }
       })();
     }
-  }, [open, profile]);
+    void loadProxies();
+    return () => {
+      proxyLoadVersion.current += 1;
+    };
+  }, [open, profile, loadProxies]);
 
   // 新建渠道里，若第一步 POST 已成功但随后 PUT /models 失败，createdProfileId 会记下
   // 这个 id，后续重试走"更新已有渠道"分支，不会重复新建渠道。
@@ -445,9 +473,13 @@ function ProfileSheet({
   // 编辑时只有明确选择更换，才允许把输入值用于保存、测试和拉取模型。
   const requestApiKey = resolveApiKeyToSend(isNew, replaceApiKey, apiKey);
 
+  function requestProxy() {
+    return llmProxyRequest(proxyDraft);
+  }
+
   async function fetchModels(): Promise<string[]> {
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, requestApiKey, proxy, profileId);
+      const r = await api.fetchLLMModels(format, baseUrl, requestApiKey, requestProxy(), profileId);
       if (r.ok && r.models && r.models.length > 0) {
         toast.success(`已加载 ${r.models.length} 个模型`);
         return r.models;
@@ -476,7 +508,7 @@ function ProfileSheet({
         defaultRow.upstreamId,
         baseUrl,
         requestApiKey,
-        proxy,
+        requestProxy(),
         toStore(thinkingType),
         toStore(effort),
         profileId,
@@ -515,7 +547,7 @@ function ProfileSheet({
           name: name.trim(),
           format,
           base_url: baseUrl.trim(),
-          proxy: proxy.trim(),
+          ...requestProxy(),
           api_key: requestApiKey,
           rate_per_second: Number(rps) || 0,
           rate_per_minute: Number(rpm) || 0,
@@ -620,24 +652,16 @@ function ProfileSheet({
             />
           </div>
 
-          <div className="grid gap-2">
-            <Label htmlFor="p-proxy">代理（可选）</Label>
-            <Input
-              id="p-proxy"
-              className="font-mono"
-              placeholder="socks5://user:pass@127.0.0.1:1080 · http://127.0.0.1:8080"
-              value={proxy}
-              onChange={(e) => setProxy(e.target.value)}
-            />
-            <p className="text-muted-foreground text-xs">
-              仅本渠道的 LLM 出站请求走此代理，支持 http/https/socks5，可带账号密码（如
-              socks5://user:pass@host:port，密码含特殊字符需 URL 编码）。
-            </p>
-            <p className="text-muted-foreground text-xs">
-              留空时不在此处直连：任务若选了「指定代理」或「明确直连」则以任务为准；任务用「继承」时走任务创建时保存的出口快照，快照为直连才直连。对话等其它入口不经过任务快照。
-            </p>
-          </div>
-
+          <LLMProxySelect
+            value={proxyDraft}
+            onChange={setProxyDraft}
+            items={proxyItems}
+            loading={proxyLoading}
+            error={proxyLoadError}
+            onReload={() => void loadProxies()}
+            legacy={proxy}
+            disabled={saving || testing}
+          />
           <div className="grid gap-2">
             <Label htmlFor="p-session-header">自定义会话头（可选）</Label>
             <Input
@@ -1037,7 +1061,7 @@ export default function LLMPage() {
                       <span>
                         {p.rate_per_second}/s · {p.rate_per_minute}/min
                       </span>
-                      {p.proxy && <span className="truncate">代理 {p.proxy}</span>}
+                      <span className="truncate">{llmProxyLabel(llmProxyDraft(p))}</span>
                       {p.reasoning_effort && (
                         <span>思考 {p.reasoning_effort === "off" ? "关" : p.reasoning_effort}</span>
                       )}

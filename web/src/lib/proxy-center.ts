@@ -42,6 +42,7 @@ export function proxyEndpoint(item: Pick<ProxyRecord, "kind" | "protocol" | "hos
 }
 
 export function proxySelectable(item: ProxyRecord): boolean {
+  if (item.kind === "warp") return warpReady(item);
   return item.enabled && ["unknown", "healthy"].includes(item.status);
 }
 
@@ -69,6 +70,8 @@ export function taskProxyError(input: {
 export function buildProxyPayload(form: ProxyForm, editing: boolean): ProxyWriteInput {
   const name = form.name.trim();
   if (!name) throw new Error("请填写代理名称");
+  // 点击“确认添加”即明确接受条款；WARP 新建一次完成注册、启动和出口验证。
+  if (form.kind === "warp" && !editing) return { name, kind: "warp", accept_terms: true };
   const data: ProxyWriteInput = { name, kind: form.kind, enabled: form.enabled };
   if (form.kind === "resin") {
     const port = Number(form.port);
@@ -123,6 +126,47 @@ export type WarpActionKind = "register" | "start" | "stop" | "recover";
 
 export function warpActionNeedsTerms(action: WarpActionKind): boolean {
   return action === "register";
+}
+
+export const WARP_TERMS_URL = "https://www.cloudflare.com/application/terms/";
+
+export function warpReady(item: ProxyRecord): boolean {
+  return (
+    item.kind === "warp" && item.enabled && item.warp_phase === "ready" && item.status === "healthy" && !!item.egress_ip
+  );
+}
+
+export function warpAllowedActions(item: ProxyRecord): WarpActionKind[] {
+  switch (item.warp_phase) {
+    case "unregistered":
+      return ["register"];
+    case "ready":
+      return warpReady(item) ? ["stop"] : ["recover"];
+    case "stopped":
+      return ["start", "recover"];
+    case "failed":
+    case "generating":
+      return ["recover"];
+    default:
+      return [];
+  }
+}
+
+export const WARP_PHASE_LABEL: Record<string, string> = {
+  unregistered: "未注册（旧条目）",
+  registering: "注册中",
+  generating: "生成连接配置中",
+  starting: "连接中",
+  ready: "已连接",
+  stopped: "已停止",
+  failed: "连接失败",
+};
+
+// 只认错误包中的已建档 ID，不按名称猜测，也不因 502 再发创建请求。
+export function proxyFromFailure(error: unknown): ProxyRecord | null {
+  const payload = (error as { payload?: { proxy_id?: unknown; proxy?: ProxyRecord } })?.payload;
+  const item = payload?.proxy;
+  return item && Number.isInteger(item.id) && item.id > 0 && payload?.proxy_id === item.id ? item : null;
 }
 
 // warpRegisterBody：注册前必须已由用户勾选确认；未确认时返回 null，调用方【不得】

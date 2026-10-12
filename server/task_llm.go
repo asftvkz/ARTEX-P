@@ -191,18 +191,20 @@ func (s *Server) applyTaskLLMProxy(ctx context.Context, t *Task, prov llm.Provid
 		return llmpool.New(members, s.llmHealth), cfg, nil
 	}
 	channelProxy := ""
+	channelMode := ""
+	var channelProxyID *int64
 	if len(profileIDs) > 0 && profileIDs[0] > 0 {
 		p, err := s.m.pg.ProfileByID(profileIDs[0])
 		if err != nil {
 			return nil, cfg, err
 		}
 		if p != nil {
-			channelProxy = p.Proxy
+			channelProxy, channelMode, channelProxyID = p.Proxy, p.ProxyMode, p.ProxyID
 		}
 	} else {
 		channelProxy = cfg.Proxy
 	}
-	override, err := s.m.ResolveLLMProxy(ctx, t, channelProxy)
+	override, err := s.m.ResolveLLMProxySelection(ctx, t, channelProxy, channelMode, channelProxyID)
 	if err != nil {
 		return nil, cfg, err
 	}

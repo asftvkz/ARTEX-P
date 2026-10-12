@@ -4,6 +4,7 @@
 // are passed through and formatted at the call site.
 
 import type { ChatMention } from "@/lib/chat-mentions";
+import { type LLMProxyRequest, llmProxyWire } from "@/lib/llm-proxy";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 import type {
@@ -117,6 +118,17 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
+export class APIError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public payload: unknown,
+  ) {
+    super(message);
+    this.name = "APIError";
+  }
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
@@ -139,15 +151,17 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (!r.ok) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
+    let payload: unknown;
     try {
-      const payload = (await r.json()) as { error?: unknown };
-      if (typeof payload.error === "string" && payload.error.trim()) {
-        message = payload.error.trim();
+      payload = await r.json();
+      const error = (payload as { error?: unknown })?.error;
+      if (typeof error === "string" && error.trim()) {
+        message = error.trim();
       }
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    throw new APIError(message, r.status, payload);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -289,6 +303,7 @@ export const api = {
     }),
   proxies: () => get<{ proxies: import("./types").ProxyRecord[]; global_proxy_id: number | null }>("/proxies"),
   createProxy: (input: ProxyWriteInput) => post<ProxyRecord>("/proxies", input),
+  proxy: (id: number) => get<ProxyRecord>(`/proxies/${id}`),
   updateProxy: (id: number, input: ProxyWriteInput) => put<ProxyRecord>(`/proxies/${id}`, input),
   deleteProxy: (id: number) => del<{ deleted: number }>(`/proxies/${id}`),
   testProxy: (id: number) => post<ProxyRecord>(`/proxies/${id}/test`),
@@ -979,10 +994,10 @@ export const api = {
     model: string,
     base_url: string,
     api_key: string,
-    proxy = "",
+    proxy: LLMProxyRequest | string | undefined = undefined,
     thinking_type = "",
     reasoning_effort = "",
-    profile_id?: number,
+    profile_id?: number | string,
     streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
     session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
   ) =>
@@ -991,7 +1006,7 @@ export const api = {
       provider,
       model,
       base_url,
-      proxy,
+      ...llmProxyWire(proxy),
       api_key,
       thinking_type,
       reasoning_effort,
@@ -1001,12 +1016,14 @@ export const api = {
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
-    id?: number; // omit/0 = create; set = update that profile
+    id?: number | string; // omit/0 = create; set = update that profile
     name: string;
     format: string;
     model: string;
     base_url?: string;
     proxy?: string;
+    proxy_mode?: "inherit" | "direct" | "fixed";
+    proxy_id?: string | null;
     api_key?: string; // blank on update keeps the existing key
     rate_per_second?: number;
     rate_per_minute?: number;
@@ -1020,7 +1037,13 @@ export const api = {
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
     retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
-  }) => post<{ id: number }>("/llm/profiles", p),
+  }) => {
+    const { proxy, ...fields } = p;
+    return post<{ id: number }>("/llm/profiles", {
+      ...fields,
+      ...llmProxyWire(p.proxy_mode !== undefined ? { proxy_mode: p.proxy_mode, proxy_id: p.proxy_id } : proxy),
+    });
+  },
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
   // 轮询链的实际顺序 + 各配置的熔断状态。
@@ -1038,12 +1061,18 @@ export const api = {
   // 全局重试策略（五层各自的次数+间隔）。全 0 = 全部走内置默认。
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
-  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
+  fetchLLMModels: (
+    provider: string,
+    base_url: string,
+    api_key: string,
+    proxy: LLMProxyRequest | string | undefined = undefined,
+    profile_id?: number | string,
+  ) =>
     post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
       provider,
       base_url,
       api_key,
-      proxy,
+      ...llmProxyWire(proxy),
       profile_id,
     }),
   // 渠道下的模型成员（子实体）。ID 全部按字符串传递，避免 JS 整数精度问题。

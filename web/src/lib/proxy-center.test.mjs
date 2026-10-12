@@ -75,7 +75,7 @@ test("WARP 创建不要求 URL 且不携带上个表单的凭据", () => {
   assert.deepEqual(buildProxyPayload(form({ kind: "warp", password: "fake", adminToken: "fake" }), false), {
     name: "出口一",
     kind: "warp",
-    enabled: true,
+    accept_terms: true,
   });
 });
 

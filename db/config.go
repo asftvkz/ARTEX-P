@@ -17,7 +17,10 @@ type LLMProfile struct {
 	Name           string  `json:"name"`
 	Format         string  `json:"format"`
 	BaseURL        string  `json:"base_url,omitempty"`
-	Proxy          string  `json:"proxy,omitempty"` // LLM 出站代理(http/https/socks5);空=用环境变量
+	Proxy          string  `json:"proxy,omitempty"` // 旧自定义URL；新选择只保存中心引用。
+	ProxyMode      string  `json:"proxy_mode"`
+	ProxyID        *int64  `json:"proxy_id"`
+	ProxySpecified bool    `json:"-"` // 旧 proxy 字段显式传入（含空字符串）。
 	Model          string  `json:"model"`
 	DefaultModelID *int64  `json:"default_model_id"`
 	APIKey         string  `json:"-"` // never serialized to UI
@@ -82,8 +85,8 @@ type RetryOverride struct {
 // profileCols is the read column list (hint variant, no api key) shared by the
 // list query; profileColsKey is the same with api_key for the single-row loads.
 const profileRetryCols = `COALESCE(retry_connect_attempts,0),COALESCE(retry_connect_interval_ms,0),COALESCE(retry_empty_attempts,0),COALESCE(retry_empty_interval_ms,0),COALESCE(retry_stream_attempts,0),COALESCE(retry_stream_interval_ms,0)`
-const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,default_model_id`
-const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,default_model_id`
+const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,default_model_id,proxy_mode,proxy_id`
+const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,default_model_id,proxy_mode,proxy_id`
 
 // scanProfile reads one row in the profileCols / profileColsKey column order. The
 // 7th column lands in APIKeyHint or APIKey depending on which list the caller used.
@@ -93,7 +96,7 @@ func scanProfile(sc interface{ Scan(...any) error }, into *string, p *LLMProfile
 		&p.MaxTokens, &p.MaxTokensField, &p.SessionHeaderKey,
 		&p.Retry.Connect.Attempts, &p.Retry.Connect.IntervalMS,
 		&p.Retry.Empty.Attempts, &p.Retry.Empty.IntervalMS,
-		&p.Retry.Stream.Attempts, &p.Retry.Stream.IntervalMS, &p.DefaultModelID)
+		&p.Retry.Stream.Attempts, &p.Retry.Stream.IntervalMS, &p.DefaultModelID, &p.ProxyMode, &p.ProxyID)
 }
 
 func (d *DB) ListProfiles() ([]*LLMProfile, error) {
@@ -170,9 +173,14 @@ func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	// 与代理停用、删除共用生命周期锁；避免校验之后引用发生变化。
+	if err := lockProxyLifecycle(tx); err != nil {
+		return 0, err
+	}
+	var previous LLMProfile
 	if p.ID != 0 {
 		// 与模型批量保存共用渠道行锁，防止两段保存提前切换默认成员。
-		err := tx.QueryRow(`SELECT model,default_model_id FROM llm_profiles WHERE id=$1 FOR UPDATE`, p.ID).Scan(&p.Model, &p.DefaultModelID)
+		err := tx.QueryRow(`SELECT model,default_model_id,COALESCE(proxy,''),proxy_mode,proxy_id FROM llm_profiles WHERE id=$1 FOR UPDATE`, p.ID).Scan(&p.Model, &p.DefaultModelID, &previous.Proxy, &previous.ProxyMode, &previous.ProxyID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, ErrLLMProfileNotFound
 		}
@@ -184,6 +192,15 @@ func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
 		if p.Model == "" {
 			return 0, fmt.Errorf("%w: 创建渠道需要一个默认上游模型 ID", ErrLLMModelInvalid)
 		}
+	}
+	if err := mergeLLMProfileProxy(tx, p, &previous); err != nil {
+		return 0, err
+	}
+	commit := func(id int64) (int64, error) {
+		if _, err := tx.Exec(`UPDATE llm_profiles SET proxy_mode=$1,proxy_id=$2 WHERE id=$3`, p.ProxyMode, p.ProxyID, id); err != nil {
+			return 0, err
+		}
+		return id, tx.Commit()
 	}
 	hint := p.APIKeyHint
 	if len(p.APIKey) >= 4 {
@@ -207,7 +224,7 @@ VALUES($1,$2,$2,true) RETURNING id`, id, p.Model).Scan(&modelID); err != nil {
 		if _, err := tx.Exec(`UPDATE llm_profiles SET default_model_id=$1 WHERE id=$2`, modelID, id); err != nil {
 			return 0, err
 		}
-		return id, tx.Commit()
+		return commit(id)
 	}
 	if p.APIKey == "" {
 		_, err := tx.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,rate_per_second=$6,rate_per_minute=$7,context_window_k=$8,reasoning_effort=$9,priority=$10,pool_exclude=$11,thinking_type=$12,streaming=$13,max_tokens=$14,max_tokens_field=$15,session_header_key=$16,retry_connect_attempts=$17,retry_connect_interval_ms=$18,retry_empty_attempts=$19,retry_empty_interval_ms=$20,retry_stream_attempts=$21,retry_stream_interval_ms=$22 WHERE id=$23`,
@@ -216,7 +233,7 @@ VALUES($1,$2,$2,true) RETURNING id`, id, p.Model).Scan(&modelID); err != nil {
 		if err != nil {
 			return 0, err
 		}
-		return p.ID, tx.Commit()
+		return commit(p.ID)
 	}
 	_, err = tx.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,api_key=$6,api_key_hint=$7,rate_per_second=$8,rate_per_minute=$9,context_window_k=$10,reasoning_effort=$11,priority=$12,pool_exclude=$13,thinking_type=$14,streaming=$15,max_tokens=$16,max_tokens_field=$17,session_header_key=$18,retry_connect_attempts=$19,retry_connect_interval_ms=$20,retry_empty_attempts=$21,retry_empty_interval_ms=$22,retry_stream_attempts=$23,retry_stream_interval_ms=$24 WHERE id=$25`,
 		p.Name, p.Format, p.BaseURL, p.Proxy, p.Model, p.APIKey, hint, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
@@ -224,7 +241,7 @@ VALUES($1,$2,$2,true) RETURNING id`, id, p.Model).Scan(&modelID); err != nil {
 	if err != nil {
 		return 0, err
 	}
-	return p.ID, tx.Commit()
+	return commit(p.ID)
 }
 
 var (

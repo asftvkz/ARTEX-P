@@ -536,7 +536,7 @@ func (d *DB) DeleteProxy(id int64) error {
 	return d.DeleteProxyWithCleanup(id, nil)
 }
 
-// DeleteProxyWithCleanup 与任务创建共享锁，清理失败时保留代理记录。
+// DeleteProxyWithCleanup 与任务创建及渠道绑定共享锁，在不可回滚的文件清理前检查引用。
 func (d *DB) DeleteProxyWithCleanup(id int64, cleanup func(*Proxy) error) error {
 	return d.withProxyLifecycle(func(tx *sql.Tx) error {
 		globalID, err := globalProxyIDTx(tx)
@@ -551,6 +551,14 @@ func (d *DB) DeleteProxyWithCleanup(id int64, cleanup func(*Proxy) error) error 
 			return err
 		}
 		if inUse {
+			return ErrProxyInUse
+		}
+		// FK 拒绝发生在 SQL 删除时已太晚；先保护运行器档案，再保留 FK 兜底。
+		var channelReferenced bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM llm_profiles WHERE proxy_id=$1)`, id).Scan(&channelReferenced); err != nil {
+			return err
+		}
+		if channelReferenced {
 			return ErrProxyInUse
 		}
 		if cleanup != nil {
