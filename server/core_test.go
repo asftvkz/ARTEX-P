@@ -18,11 +18,21 @@ import (
 // TestCoreTaskLifecyclePG exercises the migrated core (tasks/exploration on PG)
 // through the real HTTP mux: create → goal nodes seeded → list → delete cascade.
 func TestCoreTaskLifecyclePG(t *testing.T) {
+	if err := db.ConfigureProxySecrets(filepath.Join(t.TempDir(), "proxy.key")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_WARP_DIR", filepath.Join(t.TempDir(), "warp"))
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		if os.Getenv("ARTEX_PG_DSN") != "" {
+			t.Fatal(err)
+		}
+		t.Skipf("未配置测试数据库: %v", err)
 	}
 	defer m.Close()
+	if err := m.InitProxyRuntime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()

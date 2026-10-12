@@ -48,7 +48,9 @@ func decodeConversationRequest(w http.ResponseWriter, r *http.Request, value any
 
 type conversationListItem struct {
 	*db.Conversation
-	Running bool `json:"running"`
+	ProfileID *string `json:"profile_id"`
+	ModelID   *string `json:"model_id"`
+	Running   bool    `json:"running"`
 }
 
 func (s *Server) pgListConversations(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +66,7 @@ func (s *Server) pgListConversations(w http.ResponseWriter, r *http.Request) {
 	items := make([]conversationListItem, 0, len(cs))
 	s.chatMu.Lock()
 	for _, c := range cs {
-		items = append(items, conversationListItem{Conversation: c, Running: s.chatBusy[s.convBusyKey(c.ID)]})
+		items = append(items, conversationListItem{Conversation: c, ProfileID: optionalIDString(c.LLMProfileID), ModelID: optionalIDString(c.LLMModelID), Running: s.chatBusy[s.convBusyKey(c.ID)]})
 	}
 	s.chatMu.Unlock()
 	writeJSON(w, 200, map[string]any{"conversations": items})
@@ -76,9 +78,9 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		AgentKey     string `json:"agent_key"`
-		Title        string `json:"title"`
-		LLMProfileID *int64 `json:"llm_profile_id"`
+		llmBindingRequest
+		AgentKey string `json:"agent_key"`
+		Title    string `json:"title"`
 	}
 	if !decodeConversationRequest(w, r, &req) {
 		return
@@ -101,8 +103,13 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "agent 不存在")
 		return
 	}
-	if req.LLMProfileID != nil {
-		if _, ok := s.loadProfileConfig(*req.LLMProfileID); !ok {
+	selection, _, err := req.selection(nil, "", nil)
+	if err != nil {
+		writeLLMModelError(w, err)
+		return
+	}
+	if selection != nil {
+		if _, _, ok := s.loadSelectionConfig(*selection); !ok {
 			writeErr(w, 400, "指定的 LLM 配置不存在或未设置 API Key")
 			return
 		}
@@ -115,12 +122,12 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("标题最多 %d 个字符", maxConversationTitleRunes))
 		return
 	}
-	c, err := pg.CreateConversation(req.AgentKey, title, req.LLMProfileID)
+	c, err := pg.CreateConversationSelection(req.AgentKey, title, selection)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeLLMModelError(w, err)
 		return
 	}
-	writeJSON(w, 200, c)
+	writeJSON(w, 200, conversationListItem{Conversation: c, ProfileID: optionalIDString(c.LLMProfileID), ModelID: optionalIDString(c.LLMModelID)})
 }
 
 func (s *Server) pgUpdateConversation(w http.ResponseWriter, r *http.Request) {
@@ -128,20 +135,27 @@ func (s *Server) pgUpdateConversation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req struct {
-		LLMProfileID *int64 `json:"llm_profile_id"` // null clears the override
-	}
+	var req llmBindingRequest
 	if !decodeConversationRequest(w, r, &req) {
 		return
 	}
-	if req.LLMProfileID != nil {
-		if _, ok := s.loadProfileConfig(*req.LLMProfileID); !ok {
+	selection, changed, err := req.selection(c.LLMProfileID, c.LLMModelMode, c.LLMModelID)
+	if err != nil {
+		writeLLMModelError(w, err)
+		return
+	}
+	if !changed {
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	if selection != nil {
+		if _, _, ok := s.loadSelectionConfig(*selection); !ok {
 			writeErr(w, 400, "指定的 LLM 配置不存在或未设置 API Key")
 			return
 		}
 	}
-	if err := pg.UpdateConversationProfile(c.ID, req.LLMProfileID); err != nil {
-		writeErr(w, 500, err.Error())
+	if err := pg.UpdateConversationSelection(c.ID, selection); err != nil {
+		writeLLMModelError(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -207,7 +221,7 @@ func (s *Server) pgRenameConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "conversation not found")
 		return
 	}
-	writeJSON(w, 200, updated)
+	writeJSON(w, 200, conversationListItem{Conversation: updated, ProfileID: optionalIDString(updated.LLMProfileID), ModelID: optionalIDString(updated.LLMModelID)})
 }
 
 func (s *Server) pgDeleteConversation(w http.ResponseWriter, r *http.Request) {

@@ -6,22 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
 // ---------- LLM profiles ----------
 
 type LLMProfile struct {
-	ID            int64   `json:"id"`
-	Name          string  `json:"name"`
-	Format        string  `json:"format"`
-	BaseURL       string  `json:"base_url,omitempty"`
-	Proxy         string  `json:"proxy,omitempty"` // LLM 出站代理(http/https/socks5);空=用环境变量
-	Model         string  `json:"model"`
-	APIKey        string  `json:"-"` // never serialized to UI
-	APIKeyHint    string  `json:"api_key_hint,omitempty"`
-	RatePerSecond float64 `json:"rate_per_second"`
-	RatePerMinute float64 `json:"rate_per_minute"`
+	ID             int64   `json:"id"`
+	Name           string  `json:"name"`
+	Format         string  `json:"format"`
+	BaseURL        string  `json:"base_url,omitempty"`
+	Proxy          string  `json:"proxy,omitempty"` // LLM 出站代理(http/https/socks5);空=用环境变量
+	Model          string  `json:"model"`
+	DefaultModelID *int64  `json:"default_model_id"`
+	APIKey         string  `json:"-"` // never serialized to UI
+	APIKeyHint     string  `json:"api_key_hint,omitempty"`
+	RatePerSecond  float64 `json:"rate_per_second"`
+	RatePerMinute  float64 `json:"rate_per_minute"`
 	// ContextWindowK is the model's context window in K tokens, used to size
 	// compaction thresholds. 0 = use a 200K default; capped at 1000 (1M).
 	ContextWindowK int `json:"context_window_k"`
@@ -80,8 +82,8 @@ type RetryOverride struct {
 // profileCols is the read column list (hint variant, no api key) shared by the
 // list query; profileColsKey is the same with api_key for the single-row loads.
 const profileRetryCols = `COALESCE(retry_connect_attempts,0),COALESCE(retry_connect_interval_ms,0),COALESCE(retry_empty_attempts,0),COALESCE(retry_empty_interval_ms,0),COALESCE(retry_stream_attempts,0),COALESCE(retry_stream_interval_ms,0)`
-const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols
-const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols
+const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,default_model_id`
+const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,default_model_id`
 
 // scanProfile reads one row in the profileCols / profileColsKey column order. The
 // 7th column lands in APIKeyHint or APIKey depending on which list the caller used.
@@ -91,7 +93,7 @@ func scanProfile(sc interface{ Scan(...any) error }, into *string, p *LLMProfile
 		&p.MaxTokens, &p.MaxTokensField, &p.SessionHeaderKey,
 		&p.Retry.Connect.Attempts, &p.Retry.Connect.IntervalMS,
 		&p.Retry.Empty.Attempts, &p.Retry.Empty.IntervalMS,
-		&p.Retry.Stream.Attempts, &p.Retry.Stream.IntervalMS)
+		&p.Retry.Stream.Attempts, &p.Retry.Stream.IntervalMS, &p.DefaultModelID)
 }
 
 func (d *DB) ListProfiles() ([]*LLMProfile, error) {
@@ -156,8 +158,33 @@ ORDER BY is_default DESC, priority DESC, id ASC`)
 	return out, rows.Err()
 }
 
-// SaveProfile inserts (id==0) or updates a profile. Empty apiKey on update keeps existing.
+// SaveProfile 创建时种默认成员；普通更新保留服务器默认模型。空 Key 保留已保存 Key。
 func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
+	if p == nil {
+		return 0, ErrLLMModelInvalid
+	}
+	copy := *p
+	p = &copy
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if p.ID != 0 {
+		// 与模型批量保存共用渠道行锁，防止两段保存提前切换默认成员。
+		err := tx.QueryRow(`SELECT model,default_model_id FROM llm_profiles WHERE id=$1 FOR UPDATE`, p.ID).Scan(&p.Model, &p.DefaultModelID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrLLMProfileNotFound
+		}
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		p.Model = strings.TrimSpace(p.Model)
+		if p.Model == "" {
+			return 0, fmt.Errorf("%w: 创建渠道需要一个默认上游模型 ID", ErrLLMModelInvalid)
+		}
+	}
 	hint := p.APIKeyHint
 	if len(p.APIKey) >= 4 {
 		hint = "…" + p.APIKey[len(p.APIKey)-4:]
@@ -165,22 +192,39 @@ func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
 	r := p.Retry.Clamped()
 	if p.ID == 0 {
 		var id int64
-		err := d.QueryRow(`INSERT INTO llm_profiles(name,format,base_url,proxy,model,api_key,api_key_hint,rate_per_second,rate_per_minute,context_window_k,reasoning_effort,priority,pool_exclude,thinking_type,streaming,max_tokens,max_tokens_field,session_header_key,retry_connect_attempts,retry_connect_interval_ms,retry_empty_attempts,retry_empty_interval_ms,retry_stream_attempts,retry_stream_interval_ms)
+		err := tx.QueryRow(`INSERT INTO llm_profiles(name,format,base_url,proxy,model,api_key,api_key_hint,rate_per_second,rate_per_minute,context_window_k,reasoning_effort,priority,pool_exclude,thinking_type,streaming,max_tokens,max_tokens_field,session_header_key,retry_connect_attempts,retry_connect_interval_ms,retry_empty_attempts,retry_empty_interval_ms,retry_stream_attempts,retry_stream_interval_ms)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id`,
 			p.Name, p.Format, p.BaseURL, p.Proxy, p.Model, p.APIKey, hint, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
 			r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS).Scan(&id)
-		return id, err
+		if err != nil {
+			return 0, err
+		}
+		var modelID int64
+		if err := tx.QueryRow(`INSERT INTO llm_models(profile_id,upstream_model_id,display_name,enabled)
+VALUES($1,$2,$2,true) RETURNING id`, id, p.Model).Scan(&modelID); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`UPDATE llm_profiles SET default_model_id=$1 WHERE id=$2`, modelID, id); err != nil {
+			return 0, err
+		}
+		return id, tx.Commit()
 	}
 	if p.APIKey == "" {
-		_, err := d.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,rate_per_second=$6,rate_per_minute=$7,context_window_k=$8,reasoning_effort=$9,priority=$10,pool_exclude=$11,thinking_type=$12,streaming=$13,max_tokens=$14,max_tokens_field=$15,session_header_key=$16,retry_connect_attempts=$17,retry_connect_interval_ms=$18,retry_empty_attempts=$19,retry_empty_interval_ms=$20,retry_stream_attempts=$21,retry_stream_interval_ms=$22 WHERE id=$23`,
+		_, err := tx.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,rate_per_second=$6,rate_per_minute=$7,context_window_k=$8,reasoning_effort=$9,priority=$10,pool_exclude=$11,thinking_type=$12,streaming=$13,max_tokens=$14,max_tokens_field=$15,session_header_key=$16,retry_connect_attempts=$17,retry_connect_interval_ms=$18,retry_empty_attempts=$19,retry_empty_interval_ms=$20,retry_stream_attempts=$21,retry_stream_interval_ms=$22 WHERE id=$23`,
 			p.Name, p.Format, p.BaseURL, p.Proxy, p.Model, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
 			r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, p.ID)
-		return p.ID, err
+		if err != nil {
+			return 0, err
+		}
+		return p.ID, tx.Commit()
 	}
-	_, err := d.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,api_key=$6,api_key_hint=$7,rate_per_second=$8,rate_per_minute=$9,context_window_k=$10,reasoning_effort=$11,priority=$12,pool_exclude=$13,thinking_type=$14,streaming=$15,max_tokens=$16,max_tokens_field=$17,session_header_key=$18,retry_connect_attempts=$19,retry_connect_interval_ms=$20,retry_empty_attempts=$21,retry_empty_interval_ms=$22,retry_stream_attempts=$23,retry_stream_interval_ms=$24 WHERE id=$25`,
+	_, err = tx.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,api_key=$6,api_key_hint=$7,rate_per_second=$8,rate_per_minute=$9,context_window_k=$10,reasoning_effort=$11,priority=$12,pool_exclude=$13,thinking_type=$14,streaming=$15,max_tokens=$16,max_tokens_field=$17,session_header_key=$18,retry_connect_attempts=$19,retry_connect_interval_ms=$20,retry_empty_attempts=$21,retry_empty_interval_ms=$22,retry_stream_attempts=$23,retry_stream_interval_ms=$24 WHERE id=$25`,
 		p.Name, p.Format, p.BaseURL, p.Proxy, p.Model, p.APIKey, hint, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
 		r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, p.ID)
-	return p.ID, err
+	if err != nil {
+		return 0, err
+	}
+	return p.ID, tx.Commit()
 }
 
 var (
@@ -327,7 +371,7 @@ ORDER BY ref_kind, ref_id`, id)
 		return false, err
 	}
 
-	rows, err = tx.QueryContext(ctx, `SELECT x.task_id, x.position, COALESCE(t.active_llm_profile_id=$1, false)
+	rows, err = tx.QueryContext(ctx, `SELECT x.task_id, x.position, COALESCE(t.active_llm_position=x.position, false)
 FROM task_llm_profiles x
 JOIN tasks t ON t.id=x.task_id
 WHERE x.profile_id=$1
@@ -349,6 +393,12 @@ ORDER BY x.task_id`, id)
 		return false, err
 	}
 	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agents SET llm_model_mode='channel-default',llm_model_id=NULL WHERE llm_profile_id=$1`, id); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE conversations SET llm_model_mode='channel-default',llm_model_id=NULL WHERE llm_profile_id=$1`, id); err != nil {
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM llm_profiles WHERE id=$1`, id); err != nil {
@@ -377,15 +427,25 @@ LIMIT 1`, task.id, task.position).Scan(&next)
 				return false, err
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE tasks
-SET active_llm_profile_id=NULL, llm_profile_id=NULL, llm_chain_revision=llm_chain_revision+1
+SET active_llm_profile_id=NULL, llm_profile_id=NULL, active_llm_position=NULL, llm_chain_revision=llm_chain_revision+1
 WHERE id=$1`, task.id); err != nil {
 				return false, err
 			}
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks
-SET active_llm_profile_id=$2, llm_profile_id=$2, llm_chain_revision=llm_chain_revision+1
-WHERE id=$1`, task.id, next); err != nil {
+SET active_llm_profile_id=$2, llm_profile_id=$2, active_llm_position=(SELECT position FROM task_llm_profiles WHERE task_id=$1 AND profile_id=$2 AND position>$3 AND status='ready' ORDER BY position LIMIT 1), llm_chain_revision=llm_chain_revision+1
+WHERE id=$1`, task.id, next, task.position); err != nil {
+			return false, err
+		}
+	}
+	seenTasks := map[int64]bool{}
+	for _, task := range affected {
+		if seenTasks[task.id] {
+			continue
+		}
+		seenTasks[task.id] = true
+		if err := renumberTaskLLMMembers(ctx, tx, task.id); err != nil {
 			return false, err
 		}
 	}
@@ -445,7 +505,9 @@ type Agent struct {
 	Role             string `json:"role"`
 	Builtin          bool   `json:"builtin"`
 	Enabled          bool   `json:"enabled"`
-	LLMProfileID     *int64 `json:"llm_profile_id"`    // 绑定的 LLM 配置;nil=跟随任务/会话 pin,再回退全局激活
+	LLMProfileID     *int64 `json:"llm_profile_id"` // 绑定的 LLM 配置;nil=跟随任务/会话 pin,再回退全局激活
+	LLMModelMode     string `json:"model_mode"`
+	LLMModelID       *int64 `json:"model_id"`
 	MaxTurns         int    `json:"max_turns"`         // 单次运行最大轮次;0=不限制
 	RunSecs          int    `json:"run_seconds"`       // worker 单次运行墙钟上限(秒);0=不限制
 	WebSearch        bool   `json:"web_search"`        // 是否启用网络搜索(受系统全局开关门控)
@@ -464,12 +526,12 @@ type Agent struct {
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id,llm_model_mode,llm_model_id`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var prof sql.NullInt64 // llm_profile_id 可空:未绑定时为 NULL
-	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
+	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof, &a.LLMModelMode, &a.LLMModelID)
 	if err == nil && prof.Valid {
 		v := prof.Int64
 		a.LLMProfileID = &v
@@ -594,6 +656,14 @@ func (d *DB) SetAgentMaxTurns(key string, maxTurns int) error {
 // the binding (id == nil) so the agent follows the task/conversation pin, else the
 // global active profile. Precedence at runtime: agent binding → task/conv pin → active.
 func (d *DB) SetAgentLLMProfile(key string, id *int64) error {
+	var selection *LLMModelSelection
+	if id != nil {
+		selection = &LLMModelSelection{ProfileID: *id}
+	}
+	return d.SetAgentLLMSelection(key, selection)
+}
+
+func (d *DB) SetAgentLLMSelection(key string, selection *LLMModelSelection) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
@@ -610,10 +680,11 @@ func (d *DB) SetAgentLLMProfile(key string, id *int64) error {
 		}
 		return err
 	}
-	if err := lockLLMProfileForReference(tx, id); err != nil {
+	if err := lockLLMSelection(tx, selection); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE agents SET llm_profile_id=$1 WHERE id=$2`, id, agentID); err != nil {
+	profileID, mode, modelID := selectionColumns(selection)
+	if _, err := tx.Exec(`UPDATE agents SET llm_profile_id=$1,llm_model_mode=$3,llm_model_id=$4 WHERE id=$2`, profileID, agentID, mode, modelID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -815,7 +886,7 @@ type MCPServer struct {
 	Env       json.RawMessage `json:"env"`
 	URL       string          `json:"url,omitempty"`
 	Enabled   bool            `json:"enabled"`
-	Insecure  bool            `json:"insecure"` // http: skip TLS cert verification (self-signed servers, issue #108)
+	Insecure  bool            `json:"insecure"`        // http: skip TLS cert verification (self-signed servers, issue #108)
 	Tools     []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
 }
 

@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -75,9 +77,10 @@ func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	// (no usable global config) and isolates the fix from the test host's env.
 	s.cfgMu.Lock()
 	s.chatAgent = nil
+	s.llmOn = false
 	s.cfgMu.Unlock()
 
-	id, err := m.pg.SaveProfile(&db.LLMProfile{Name: "conv-pick", Format: "anthropic", Model: "claude-x", APIKey: "sk-test"})
+	id, err := m.pg.SaveProfile(&db.LLMProfile{Name: fmt.Sprintf("conv-pick-%d", time.Now().UnixNano()), Format: "anthropic", Model: "claude-x", APIKey: "sk-test"})
 	if err != nil {
 		t.Fatal(err)
 	}

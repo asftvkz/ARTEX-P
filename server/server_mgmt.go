@@ -357,12 +357,12 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	// only trigger_* fields) leaves the untouched settings alone instead of resetting
 	// max_turns/run_seconds to 0.
 	var req struct {
+		llmBindingRequest
 		MaxTurns         *int  `json:"max_turns"`
 		RunSeconds       *int  `json:"run_seconds"`
 		WebSearch        *bool `json:"web_search"`
 		InteractiveShell *bool `json:"interactive_shell"`
 		// llm_profile_id 三态:字段缺省=不动;显式 null=解绑(跟随任务/全局);数字=绑定该 profile。
-		LLMProfileID json.RawMessage `json:"llm_profile_id"`
 		// P3 触发后处理策略(三者一起可选,提供任一即整体写入;未提供则不动)。
 		TriggerRunMode     *string `json:"trigger_run_mode"`
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
@@ -373,20 +373,20 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profileChanged := false
-	if req.LLMProfileID != nil { // key present (数字 或 null)
-		var id *int64
-		if err := json.Unmarshal(req.LLMProfileID, &id); err != nil {
-			writeErr(w, 400, "llm_profile_id 格式错误")
-			return
-		}
-		if id != nil { // 绑定:校验目标 profile 有效
-			if _, ok := s.loadProfileConfig(*id); !ok {
+	selection, changed, err := req.selection(a.LLMProfileID, a.LLMModelMode, a.LLMModelID)
+	if err != nil {
+		writeLLMModelError(w, err)
+		return
+	}
+	if changed {
+		if selection != nil { // 绑定:校验目标 profile 有效
+			if _, _, ok := s.loadSelectionConfig(*selection); !ok {
 				writeErr(w, 400, "指定的 LLM 配置不存在或无效")
 				return
 			}
 		}
-		if err := pg.SetAgentLLMProfile(a.Key, id); err != nil {
-			writeErr(w, 500, err.Error())
+		if err := pg.SetAgentLLMSelection(a.Key, selection); err != nil {
+			writeLLMModelError(w, err)
 			return
 		}
 		profileChanged = true
@@ -1889,7 +1889,7 @@ func (s *Server) pgDeleteProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidateProfileAgents() // drop cached agents for the removed profile
-	s.llmHealth.Reset(id)       // its breaker state is meaningless now (row is FK-cascaded away)
+	_ = s.llmHealth.ResetMatching(func(key string) bool { profileID, _, _ := parseLLMMemberKey(key); return profileID == id }, nil)
 	s.restoreTasksAfterProfileDelete(pg)
 	// Cache invalidation also removed the active profile's shared provider entry.
 	// Reapply after task-state sync so the wake-up observes the post-delete chain.
@@ -1956,17 +1956,31 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ID int64 `json:"id"` // 0 / omitted = all
+		ID        int64  `json:"id"` // 0 / omitted = all
+		MemberKey string `json:"member_key"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if body.ID > 0 {
-		s.llmHealth.Reset(body.ID)
+	if body.MemberKey != "" {
+		pid, mid, ok := parseLLMMemberKey(body.MemberKey)
+		if !ok {
+			writeErr(w, 400, "无效成员键")
+			return
+		}
+		if err := s.llmHealth.ResetMatching(func(key string) bool { return key == body.MemberKey }, func() error { return pg.ClearLLMModelHealth(pid, mid) }); err != nil {
+			writeErr(w, 500, "恢复成员失败")
+			return
+		}
 	} else {
-		for id := range s.llmHealth.Snapshot() {
-			s.llmHealth.Reset(id)
+		if body.ID < 0 {
+			writeErr(w, 400, "无效渠道 ID")
+			return
+		}
+		if err := s.llmHealth.ResetMatching(func(key string) bool { pid, _, _ := parseLLMMemberKey(key); return body.ID == 0 || pid == body.ID }, func() error { return pg.ClearLLMHealth(body.ID) }); err != nil {
+			writeErr(w, 500, "恢复渠道失败")
+			return
 		}
 	}
 	writeJSON(w, 200, s.llmPoolStatus())
@@ -1990,9 +2004,27 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolve API key: form input > profile stored key.
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+	if req.ProfileID != nil {
+		p, err := s.m.pg.ProfileByID(*req.ProfileID)
+		if err != nil {
+			writeErr(w, 500, "读取渠道失败")
+			return
+		}
+		if p == nil {
+			writeErr(w, 404, "渠道不存在")
+			return
+		}
+		if apiKey == "" {
 			apiKey = p.APIKey
+		}
+		if strings.TrimSpace(req.Provider) == "" {
+			req.Provider = p.Format
+		}
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = p.BaseURL
+		}
+		if strings.TrimSpace(req.Proxy) == "" {
+			req.Proxy = p.Proxy
 		}
 	}
 	if apiKey == "" {
@@ -2051,11 +2083,20 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 
 	// Build HTTP client with optional proxy.
 	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
-			transport.Proxy = http.ProxyURL(pu)
-		}
+	proxy, err := s.m.ResolveLLMProxy(r.Context(), nil, req.Proxy)
+	if err != nil {
+		writeErr(w, 400, "代理解析失败")
+		return
 	}
+	if proxy != "" {
+		pu, err := url.Parse(proxy)
+		if err != nil || pu.Host == "" {
+			writeErr(w, 400, "代理配置无效")
+			return
+		}
+		transport.Proxy = http.ProxyURL(pu)
+	}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 
 	// Try each candidate; return the first that yields a non-empty model list.
@@ -2070,13 +2111,13 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		httpReq.Header = c.hdr
 		resp, err := client.Do(httpReq)
 		if err != nil {
-			lastErr = "请求失败: " + err.Error()
+			lastErr = "请求失败"
 			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
+			lastErr = fmt.Sprintf("API 返回 %d", resp.StatusCode)
 			continue
 		}
 		// Both OpenAI and Anthropic return {"data": [{"id": "..."},...]}.
@@ -2091,7 +2132,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 		models := make([]string, 0, len(parsed.Data))
 		for _, m := range parsed.Data {
-			if m.ID != "" {
+			if m.ID != "" && !strings.Contains(m.ID, apiKey) {
 				models = append(models, m.ID)
 			}
 		}

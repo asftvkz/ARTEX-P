@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -30,37 +31,101 @@ func rawString(raw json.RawMessage) string {
 
 // ---- Task (frontend "Task") ---- created_at as RFC3339, plus a derived status.
 type TaskDTO struct {
-	ID                 string             `json:"id"`
-	ExplorationID      int64              `json:"exploration_id"`
-	Name               string             `json:"name"` // 可选任务名称;空=未命名
-	CategoryID         *int64             `json:"category_id,omitempty"`
-	CategoryName       string             `json:"category_name,omitempty"`
-	Pinned             bool               `json:"pinned"`
-	PinnedAt           string             `json:"pinned_at,omitempty"`
-	Description        string             `json:"description"`
-	Goal               string             `json:"goal"`
-	Status             string             `json:"status"` // created | running | paused | done | failed
-	CreatedAt          string             `json:"created_at"`
-	CreatedUnix        int64              `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
-	CompletedAt        string             `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
-	CompletedUnix      int64              `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
-	LastActivity       int64              `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
-	Paused             bool               `json:"paused"`
-	Queued             bool               `json:"queued"`
-	Tokens             TokenTotalDTO      `json:"tokens"` // whole-task token consumption
-	GoalsTotal         int                `json:"goals_total"`
-	GoalsMet           int                `json:"goals_met"`
-	InFlight           int                `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
-	Findings           FindingSeverityDTO `json:"findings"`                 // 该任务已登记的漏洞数（findings 表，按严重度分档）
-	LLMProfileID       *int64             `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
-	LLMProfileIDs      []int64            `json:"llm_profile_ids"`
-	ActiveLLMProfileID *int64             `json:"active_llm_profile_id,omitempty"`
-	LLMFailoverState   string             `json:"llm_failover_state"`
-	LLMFailoverReason  string             `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []string           `json:"source_task_ids"`
-	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
-	CompanyIDs         []int64            `json:"company_ids"`
-	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	ID                 string                 `json:"id"`
+	ExplorationID      int64                  `json:"exploration_id"`
+	Name               string                 `json:"name"` // 可选任务名称;空=未命名
+	CategoryID         *int64                 `json:"category_id,omitempty"`
+	CategoryName       string                 `json:"category_name,omitempty"`
+	Pinned             bool                   `json:"pinned"`
+	PinnedAt           string                 `json:"pinned_at,omitempty"`
+	Description        string                 `json:"description"`
+	Goal               string                 `json:"goal"`
+	Status             string                 `json:"status"` // created | running | paused | done | failed
+	CreatedAt          string                 `json:"created_at"`
+	CreatedUnix        int64                  `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
+	CompletedAt        string                 `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
+	CompletedUnix      int64                  `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
+	LastActivity       int64                  `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
+	Paused             bool                   `json:"paused"`
+	Queued             bool                   `json:"queued"`
+	Tokens             TokenTotalDTO          `json:"tokens"` // whole-task token consumption
+	GoalsTotal         int                    `json:"goals_total"`
+	GoalsMet           int                    `json:"goals_met"`
+	InFlight           int                    `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
+	Findings           FindingSeverityDTO     `json:"findings"`                 // 该任务已登记的漏洞数（findings 表，按严重度分档）
+	LLMProfileID       *int64                 `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
+	LLMProfileIDs      []int64                `json:"llm_profile_ids"`
+	Members            []LLMModelSelectionDTO `json:"members"`
+	ActivePosition     *int                   `json:"active_position"`
+	ActiveMember       *LLMResolvedMemberDTO  `json:"active_member"`
+	ActiveLLMProfileID *int64                 `json:"active_llm_profile_id,omitempty"`
+	LLMFailoverState   string                 `json:"llm_failover_state"`
+	LLMFailoverReason  string                 `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs      []string               `json:"source_task_ids"`
+	ArchiveBlockedBy   string                 `json:"archive_blocked_by_task_id,omitempty"`
+	CompanyIDs         []int64                `json:"company_ids"`
+	CoverageEnabled    bool                   `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	ProxyMode          db.TaskProxyMode       `json:"proxy_mode"`
+	ProxyID            *int64                 `json:"proxy_id,omitempty"`
+	Proxy              *ProxyDTO              `json:"proxy,omitempty"`
+}
+
+type ProxyDTO struct {
+	Protocol           string       `json:"protocol"`
+	HasPassword        bool         `json:"has_password"`
+	HasResinAdminToken bool         `json:"has_resin_admin_token"`
+	ID                 int64        `json:"id"`
+	Name               string       `json:"name"`
+	Kind               db.ProxyKind `json:"kind"`
+	URL                string       `json:"url,omitempty"`
+	Host               string       `json:"host,omitempty"`
+	Port               int          `json:"port,omitempty"`
+	Username           string       `json:"username,omitempty"`
+	ResinPlatform      string       `json:"resin_platform,omitempty"`
+	ResinAdminURL      string       `json:"resin_admin_url,omitempty"`
+	Enabled            bool         `json:"enabled"`
+	Status             string       `json:"status"`
+	LastError          string       `json:"last_error,omitempty"`
+	LastCheckedAt      string       `json:"last_checked_at,omitempty"`
+}
+
+func proxyDTO(p *db.Proxy) *ProxyDTO {
+	if p == nil {
+		return nil
+	}
+	protocol, hasPassword := proxyCredentialFlags(p.Protocol, p.URL, p.Password)
+	return &ProxyDTO{Protocol: protocol, HasPassword: hasPassword, HasResinAdminToken: p.ResinAdminToken != "", ID: p.ID, Name: p.Name, Kind: p.Kind, URL: maskProxyURL(p.URL), Host: p.Host, Port: p.Port, Username: p.Username, ResinPlatform: p.ResinPlatform, ResinAdminURL: maskProxyURL(p.ResinAdminURL), Enabled: p.Enabled, Status: p.Status, LastError: p.LastError, LastCheckedAt: func() string {
+		if p.LastCheckedAt == nil {
+			return ""
+		}
+		return p.LastCheckedAt.Format(time.RFC3339)
+	}()}
+}
+
+func proxyCredentialFlags(protocol, raw, password string) (string, bool) {
+	has := password != ""
+	if u, err := url.Parse(raw); err == nil {
+		if protocol == "" {
+			protocol = u.Scheme
+		}
+		if u.User != nil {
+			secret, present := u.User.Password()
+			has = has || (present && secret != "")
+		}
+	}
+	return protocol, has
+}
+
+func maskProxyURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	if u.User != nil {
+		name := u.User.Username()
+		u.User = url.User(name + ":***")
+	}
+	return u.String()
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
@@ -110,31 +175,43 @@ func taskDTO(t *Task, status string) TaskDTO {
 	}
 	profileIDs := append(make([]int64, 0, len(llmState.ProfileIDs)), llmState.ProfileIDs...)
 	return TaskDTO{
-		ID:                 t.ID,
-		ExplorationID:      t.ExpID,
-		Name:               lifecycle.Name,
-		CategoryID:         lifecycle.CategoryID,
-		CategoryName:       lifecycle.CategoryName,
-		Pinned:             lifecycle.PinnedAt > 0,
-		PinnedAt:           completedRFC(lifecycle.PinnedAt),
-		Description:        t.Description,
-		Goal:               t.Goal,
-		Status:             status,
-		CreatedAt:          rfc3339(time.Unix(t.CreatedAt, 0)),
-		CreatedUnix:        t.CreatedAt,
-		CompletedAt:        completedRFC(lifecycle.CompletedAt),
-		CompletedUnix:      lifecycle.CompletedAt,
-		Paused:             lifecycle.Paused,
-		Queued:             lifecycle.Queued,
-		LLMProfileID:       llmState.ProfileID,
-		LLMProfileIDs:      profileIDs,
+		ID:            t.ID,
+		ExplorationID: t.ExpID,
+		Name:          lifecycle.Name,
+		CategoryID:    lifecycle.CategoryID,
+		CategoryName:  lifecycle.CategoryName,
+		Pinned:        lifecycle.PinnedAt > 0,
+		PinnedAt:      completedRFC(lifecycle.PinnedAt),
+		Description:   t.Description,
+		Goal:          t.Goal,
+		Status:        status,
+		CreatedAt:     rfc3339(time.Unix(t.CreatedAt, 0)),
+		CreatedUnix:   t.CreatedAt,
+		CompletedAt:   completedRFC(lifecycle.CompletedAt),
+		CompletedUnix: lifecycle.CompletedAt,
+		Paused:        lifecycle.Paused,
+		Queued:        lifecycle.Queued,
+		LLMProfileID:  llmState.ProfileID,
+		LLMProfileIDs: profileIDs,
+		Members:       llmSelectionsDTO(llmState.Members), ActivePosition: llmState.ActivePosition, ActiveMember: t.activeLLMMember(llmState),
 		ActiveLLMProfileID: llmState.ActiveID,
 		LLMFailoverState:   llmState.FailoverState,
 		LLMFailoverReason:  llmState.FailoverReason,
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
+		ProxyMode:          t.ProxyMode,
+		ProxyID:            t.ProxyID,
+		Proxy:              proxySnapshotDTO(t.ProxySnapshot),
 	}
+}
+
+func proxySnapshotDTO(s db.ProxySnapshot) *ProxyDTO {
+	if s.ID == 0 {
+		return nil
+	}
+	protocol, hasPassword := proxyCredentialFlags(s.Protocol, s.URL, s.Password)
+	return &ProxyDTO{Protocol: protocol, HasPassword: hasPassword, HasResinAdminToken: s.AdminToken != "", ID: s.ID, Name: s.Name, Kind: s.Kind, URL: maskProxyURL(s.URL), Host: s.Host, Port: s.Port, Username: s.Username, ResinPlatform: s.Platform}
 }
 
 // completedRFC renders a unix completion time as RFC3339, or "" when unset (0).
@@ -533,18 +610,21 @@ func activityDTOs(in []db.Activity) []ActivityDTO {
 // ---- Agent (frontend "Agent") — string id ----
 
 type AgentDTO struct {
-	ID               string `json:"id"`
-	Key              string `json:"key"`
-	Name             string `json:"name"`
-	Description      string `json:"description"`
-	Role             string `json:"role"`
-	Builtin          bool   `json:"builtin"`
-	Enabled          bool   `json:"enabled"`
-	MaxTurns         int    `json:"max_turns"`
-	RunSecs          int    `json:"run_seconds"`
-	WebSearch        bool   `json:"web_search"`
-	InteractiveShell bool   `json:"interactive_shell"`
-	LLMProfileID     *int64 `json:"llm_profile_id"` // 绑定的 LLM 配置;null=跟随任务/全局
+	ID               string  `json:"id"`
+	Key              string  `json:"key"`
+	Name             string  `json:"name"`
+	Description      string  `json:"description"`
+	Role             string  `json:"role"`
+	Builtin          bool    `json:"builtin"`
+	Enabled          bool    `json:"enabled"`
+	MaxTurns         int     `json:"max_turns"`
+	RunSecs          int     `json:"run_seconds"`
+	WebSearch        bool    `json:"web_search"`
+	InteractiveShell bool    `json:"interactive_shell"`
+	LLMProfileID     *int64  `json:"llm_profile_id"` // 绑定的 LLM 配置;null=跟随任务/全局
+	ProfileID        *string `json:"profile_id"`
+	ModelMode        string  `json:"model_mode"`
+	ModelID          *string `json:"model_id"`
 	// P3 触发后处理策略(仅自定义 agent 有意义)。
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
@@ -557,18 +637,19 @@ type AgentDTO struct {
 
 func agentDTO(a *db.Agent) AgentDTO {
 	return AgentDTO{
-		ID:                 i64s(a.ID),
-		Key:                a.Key,
-		Name:               a.Name,
-		Description:        a.Description,
-		Role:               a.Role,
-		Builtin:            a.Builtin,
-		Enabled:            a.Enabled,
-		MaxTurns:           a.MaxTurns,
-		RunSecs:            a.RunSecs,
-		WebSearch:          a.WebSearch,
-		InteractiveShell:   a.InteractiveShell,
-		LLMProfileID:       a.LLMProfileID,
+		ID:               i64s(a.ID),
+		Key:              a.Key,
+		Name:             a.Name,
+		Description:      a.Description,
+		Role:             a.Role,
+		Builtin:          a.Builtin,
+		Enabled:          a.Enabled,
+		MaxTurns:         a.MaxTurns,
+		RunSecs:          a.RunSecs,
+		WebSearch:        a.WebSearch,
+		InteractiveShell: a.InteractiveShell,
+		LLMProfileID:     a.LLMProfileID,
+		ProfileID:        optionalIDString(a.LLMProfileID), ModelMode: a.LLMModelMode, ModelID: optionalIDString(a.LLMModelID),
 		TriggerRunMode:     a.TriggerRunMode,
 		TriggerMergeMode:   a.TriggerMergeMode,
 		TriggerMaxParallel: a.TriggerMaxParallel,

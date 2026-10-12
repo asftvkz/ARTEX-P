@@ -10,14 +10,16 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -329,6 +331,10 @@ func ensureSchema(raw json.RawMessage) map[string]any {
 // ---------- command:渲染命令 → 复用 Bash 底层 run ----------
 
 func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, params map[string]any, tc *actool.ToolContext) (actool.Result, error) {
+	var err error
+	if tc, err = s.taskToolContext(ctx, tc); err != nil {
+		return actool.Errorf("任务命令出口不可用"), nil
+	}
 	var spec commandExec
 	_ = json.Unmarshal(execRaw, &spec)
 	if strings.TrimSpace(spec.Command) == "" {
@@ -349,6 +355,10 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 // ---------- script(仅 Python):临时文件 + stdin JSON + env ----------
 
 func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.RawMessage, params map[string]any, tc *actool.ToolContext) (actool.Result, error) {
+	var routeErr error
+	if tc, routeErr = s.taskToolContext(ctx, tc); routeErr != nil {
+		return actool.Errorf("任务脚本出口不可用"), nil
+	}
 	var spec scriptExec
 	_ = json.Unmarshal(execRaw, &spec)
 	if strings.TrimSpace(spec.Code) == "" {
@@ -441,13 +451,15 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	for k, v := range spec.Headers {
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
-	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
-	if tr := s.httpProxyTransport(spec); tr != nil {
-		client.Transport = tr
+	tr, err := s.taskHTTPTransport(ctx, spec, tc)
+	if err != nil {
+		return actool.Errorf("任务 HTTP 出口不可用"), nil
 	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000), Transport: tr}
 	resp, err := client.Do(req)
 	if err != nil {
-		return actool.Errorf("请求失败: " + err.Error()), nil
+		return actool.Errorf("HTTP 请求失败，出口未回退直连"), nil
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -458,32 +470,89 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 
 // httpProxyTransport builds a Transport for the http tool's proxy config, or nil
 // (direct). use_recording_proxy routes through the recording proxy + trusts its CA.
-func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
+func (s *Server) taskHTTPTransport(ctx context.Context, spec httpExec, tc *actool.ToolContext) (*http.Transport, error) {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
-	if spec.UseRecordingProxy {
+	if id := agent.RunInfoFrom(ctx).TaskID; id > 0 {
+		row, err := s.m.pg.GetTask(id)
+		if err != nil {
+			return nil, err
+		}
+		proxyStr, caFile, err = s.m.TaskToolProxy(ctx, &Task{ID: strconv.FormatInt(id, 10), ProxyMode: row.ProxyMode, ProxyID: row.ProxyID, ProxySnapshot: row.ProxySnapshot})
+		if err != nil {
+			return nil, err
+		}
+	} else if tc != nil && hasProxyEnvironment(tc.Env) {
+		proxyStr = ""
+		for _, entry := range tc.Env {
+			k, v, _ := strings.Cut(entry, "=")
+			if k == "HTTPS_PROXY" {
+				proxyStr = v
+			}
+			if k == "SSL_CERT_FILE" {
+				caFile = v
+			}
+		}
+	} else if spec.UseRecordingProxy {
 		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
+			proxyStr = addr
 			caFile = s.m.ProxyCACert()
 		}
 	}
+	tr := &http.Transport{Proxy: nil}
 	if proxyStr == "" {
-		return nil
+		return tr, nil
 	}
-	pu, err := url.Parse(proxyStr)
+	pu, err := egress.ProxyURL(proxyStr)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
+	tr.Proxy = http.ProxyURL(pu)
 	if caFile != "" {
-		if pem, err := os.ReadFile(caFile); err == nil {
-			pool := x509.NewCertPool()
-			if pool.AppendCertsFromPEM(pem) {
-				tr.TLSClientConfig = &tls.Config{RootCAs: pool}
-			}
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("录制代理证书不可读")
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("录制代理证书无效")
+		}
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool}
+	}
+	return tr, nil
+}
+
+func hasProxyEnvironment(env []string) bool {
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "HTTPS_PROXY=") {
+			return true
 		}
 	}
-	return tr
+	return false
+}
+
+func (s *Server) taskToolContext(ctx context.Context, tc *actool.ToolContext) (*actool.ToolContext, error) {
+	id := agent.RunInfoFrom(ctx).TaskID
+	if id <= 0 {
+		return tc, nil
+	}
+	row, err := s.m.pg.GetTask(id)
+	if err != nil {
+		return nil, err
+	}
+	addr, ca, err := s.m.TaskToolProxy(ctx, &Task{ID: strconv.FormatInt(id, 10), ProxyMode: row.ProxyMode, ProxyID: row.ProxyID, ProxySnapshot: row.ProxySnapshot})
+	if err != nil {
+		return nil, err
+	}
+	copy := actool.ToolContext{}
+	if tc != nil {
+		copy = *tc
+	}
+	copy.Env = append(append([]string{}, copy.Env...), agent.ProxyEnvironment(addr, ca)...)
+	return &copy, nil
 }
 
 // ---------- helpers ----------

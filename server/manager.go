@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -42,22 +43,27 @@ type Task struct {
 	// QueuedAt is an internal Unix-nanosecond ordering key. It is deliberately
 	// finer than CreatedAt so several tasks enqueued in the same second retain
 	// their real FIFO order.
-	QueuedAt           int64   `json:"queued_at,omitempty"`
-	QueueMode          string  `json:"queue_mode,omitempty"`
-	ParentRef          string  `json:"parent_ref,omitempty"`     // 父任务 id(编排 spawn 记录)
-	LLMProfileID       *int64  `json:"llm_profile_id,omitempty"` // 指定运行本任务 planner/worker 的 LLM 配置;nil=用全局激活配置
-	LLMProfileIDs      []int64 `json:"llm_profile_ids,omitempty"`
-	ActiveLLMProfileID *int64  `json:"active_llm_profile_id,omitempty"`
-	LLMChainRevision   int64   `json:"-"`
-	LLMFailoverState   string  `json:"llm_failover_state,omitempty"`
-	LLMFailoverReason  string  `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []int64 `json:"source_task_ids,omitempty"`
-	CompanyIDs         []int64 `json:"company_ids,omitempty"`
-	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
+	QueuedAt           int64                    `json:"queued_at,omitempty"`
+	QueueMode          string                   `json:"queue_mode,omitempty"`
+	ParentRef          string                   `json:"parent_ref,omitempty"`     // 父任务 id(编排 spawn 记录)
+	LLMProfileID       *int64                   `json:"llm_profile_id,omitempty"` // 指定运行本任务 planner/worker 的 LLM 配置;nil=用全局激活配置
+	LLMProfileIDs      []int64                  `json:"llm_profile_ids,omitempty"`
+	LLMMembers         []pgdb.LLMModelSelection `json:"members"`
+	ActiveLLMPosition  *int                     `json:"active_position,omitempty"`
+	ActiveLLMProfileID *int64                   `json:"active_llm_profile_id,omitempty"`
+	LLMChainRevision   int64                    `json:"-"`
+	LLMFailoverState   string                   `json:"llm_failover_state,omitempty"`
+	LLMFailoverReason  string                   `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs      []int64                  `json:"source_task_ids,omitempty"`
+	CompanyIDs         []int64                  `json:"company_ids,omitempty"`
+	Status             string                   `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	ProxyMode            pgdb.TaskProxyMode     `json:"proxy_mode"`
+	ProxyID              *int64                 `json:"proxy_id,omitempty"`
+	ProxySnapshot        pgdb.ProxySnapshot     `json:"proxy_snapshot,omitempty"`
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	Store                *pgdb.ExplorationStore `json:"-"`
@@ -147,6 +153,8 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 }
 
 type taskLLMState struct {
+	Members        []pgdb.LLMModelSelection
+	ActivePosition *int
 	ProfileID      *int64
 	ProfileIDs     []int64
 	ActiveID       *int64
@@ -167,6 +175,7 @@ func (t *Task) llmStateSnapshot() taskLLMState {
 	t.llmMu.RLock()
 	defer t.llmMu.RUnlock()
 	return taskLLMState{
+		Members: cloneLLMSelections(t.LLMMembers), ActivePosition: cloneIntPtr(t.ActiveLLMPosition),
 		ProfileID:      cloneInt64Ptr(t.LLMProfileID),
 		ProfileIDs:     append(make([]int64, 0, len(t.LLMProfileIDs)), t.LLMProfileIDs...),
 		ActiveID:       cloneInt64Ptr(t.ActiveLLMProfileID),
@@ -176,7 +185,7 @@ func (t *Task) llmStateSnapshot() taskLLMState {
 	}
 }
 
-func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revision int64, state, reason string) bool {
+func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revision int64, state, reason string, persisted ...*pgdb.Task) bool {
 	t.llmMu.Lock()
 	defer t.llmMu.Unlock()
 	if revision < t.LLMChainRevision {
@@ -188,7 +197,41 @@ func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revis
 	t.LLMChainRevision = revision
 	t.LLMFailoverState = state
 	t.LLMFailoverReason = reason
+	if len(persisted) > 0 {
+		t.LLMMembers = cloneLLMSelections(persisted[0].LLMMembers)
+		t.ActiveLLMPosition = cloneIntPtr(persisted[0].ActiveLLMPosition)
+	}
 	return true
+}
+
+func cloneIntPtr(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	copy := *v
+	return &copy
+}
+
+func (t *Task) activeLLMMember(state taskLLMState) *LLMResolvedMemberDTO {
+	if t.Store == nil || state.ActiveID == nil {
+		return nil
+	}
+	selection := pgdb.LLMModelSelection{ProfileID: *state.ActiveID}
+	if state.ActivePosition != nil && *state.ActivePosition < len(state.Members) {
+		selection = state.Members[*state.ActivePosition]
+	}
+	model, err := t.Store.ResolveLLMMember(selection)
+	if err != nil {
+		return nil
+	}
+	return resolvedMemberDTO(model, selection.ModelMode)
+}
+func cloneLLMSelections(in []pgdb.LLMModelSelection) []pgdb.LLMModelSelection {
+	out := append([]pgdb.LLMModelSelection(nil), in...)
+	for i := range out {
+		out[i].ModelID = cloneInt64Ptr(out[i].ModelID)
+	}
+	return out
 }
 
 // DeleteTaskOptions controls cleanup of data stored outside the task's own
@@ -227,12 +270,15 @@ type Manager struct {
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
 	// their in-memory mirrors. lifecycleMu makes snapshots race-free, but without
 	// this outer write lock an older request could commit first and publish last.
-	taskStateMu sync.Mutex
-	mu          sync.RWMutex
-	tasks       map[string]*Task
-	active      string
-	trafficOn   bool // 流量捕获开关（默认关；settings.traffic_capture）
-	llmRecOn    bool // LLM 录制开关（默认关；settings.llm_record）
+	taskStateMu   sync.Mutex
+	proxyEngine   *Engine // 启动时安装，协调所有任务出口使用者与回收
+	proxyBarriers sync.Map
+	proxyTickets  sync.Map
+	mu            sync.RWMutex
+	tasks         map[string]*Task
+	active        string
+	trafficOn     bool // 流量捕获开关（默认关；settings.traffic_capture）
+	llmRecOn      bool // LLM 录制开关（默认关；settings.llm_record）
 	// 联网搜索开关与来源（默认关；settings.web_search_*）。brave-free 需要 braveKey；tavily 需要 tavilyKey。
 	// webSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关。
 	webSearchOn      bool
@@ -368,10 +414,12 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		return nil, fmt.Errorf("recover finding retests: %w", err)
 	}
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
-		log.Printf("[llmrec] create table: %v", err)
+		pg.Close()
+		return nil, fmt.Errorf("初始化 LLM 录制表: %w", err)
 	}
 	if err := pg.EnsureLLMUsageTable(); err != nil {
-		log.Printf("[llmusage] create table: %v", err)
+		pg.Close()
+		return nil, fmt.Errorf("初始化 LLM 用量表: %w", err)
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	if proxyAddr != "" {
@@ -428,16 +476,12 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if v, ok, _ := pg.GetSetting(settingWebSearchProxy); ok {
 		m.webSearchProxy = v
 	}
-	// Global egress proxy (default: direct). When capture is on, feed it to the
-	// MITM as its upstream so recorded traffic exits through it; when capture is
-	// off, ProxyAddr hands it to agents directly (bash env / WebFetch).
-	if v, ok, _ := pg.GetSetting(settingGlobalProxy); ok {
-		m.globalProxy = strings.TrimSpace(v)
-	}
-	if m.traffic != nil {
-		if err := m.traffic.SetUpstreamProxy(m.globalProxy); err != nil {
-			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
+	if err := pg.MigrateLegacyProxy(); err != nil {
+		if m.traffic != nil {
+			_ = m.traffic.Close()
 		}
+		_ = pg.Close()
+		return nil, fmt.Errorf("迁移旧全局代理: %w", err)
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
@@ -780,33 +824,19 @@ func (m *Manager) GlobalProxy() string {
 func (m *Manager) SetGlobalProxy(raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw != "" {
-		if _, err := traffic.ValidateProxyURL(raw); err != nil {
-			return err
-		}
+		return errors.New("请通过代理中心选择 global_proxy_id，旧 URL 写入已停用")
 	}
-	if err := m.pg.SetSetting(settingGlobalProxy, raw); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.globalProxy = raw
-	m.mu.Unlock()
-	if m.traffic != nil {
-		if err := m.traffic.SetUpstreamProxy(raw); err != nil {
-			return err
-		}
-	}
-	// Keep the browser MCP's egress in sync with the new global proxy too.
-	m.syncBrowserMCPProxy()
-	return nil
+	return m.pg.SetGlobalProxyID(nil)
 }
 
 func (m *Manager) Close() error {
+	runtimeErr := m.CloseProxyRuntime()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
-	return m.pg.Close()
+	return errors.Join(runtimeErr, m.pg.Close())
 }
 
 // isTerminalStatus reports whether a task status is terminal (done/failed/timeout).
@@ -839,13 +869,15 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompletedAt: unixOrZero(pt.CompletedAt), Status: pt.Status, ParentRef: pt.ParentRef,
 		LLMProfileID:  pt.LLMProfileID,
 		LLMProfileIDs: append([]int64(nil), pt.LLMProfileIDs...), ActiveLLMProfileID: pt.ActiveLLMProfileID,
+		LLMMembers: cloneLLMSelections(pt.LLMMembers), ActiveLLMPosition: cloneIntPtr(pt.ActiveLLMPosition),
 		LLMChainRevision: pt.LLMChainRevision,
 		LLMFailoverState: pt.LLMFailoverState, LLMFailoverReason: pt.LLMFailoverReason,
 		SourceTaskIDs:  append([]int64(nil), pt.SourceTaskIDs...),
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
-		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
+		ProxyMode:       pt.ProxyMode, ProxyID: cloneInt64Ptr(pt.ProxyID), ProxySnapshot: pt.ProxySnapshot,
+		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
 }
@@ -1048,11 +1080,19 @@ func (m *Manager) DeleteCompanyWithAssets(id int64, deleteAssets bool) (int64, e
 // committed state onto the live task handle. Terminal tasks are editable too —
 // their 主 Agent 对话 keeps running on the chain after the task finishes.
 func (m *Manager) ReplaceTaskLLMProfiles(id string, profileIDs []int64, activeProfileID int64) (int64, error) {
+	return m.replaceTaskLLM(id, func(n int64) error { return m.pg.ReplaceTaskLLMProfiles(n, profileIDs, activeProfileID) })
+}
+
+func (m *Manager) ReplaceTaskLLMMembers(id string, members []pgdb.LLMModelSelection, position *int) (int64, error) {
+	return m.replaceTaskLLM(id, func(n int64) error { return m.pg.ReplaceTaskLLMMembers(n, members, position) })
+}
+
+func (m *Manager) replaceTaskLLM(id string, mutation func(int64) error) (int64, error) {
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return 0, err
 	}
-	if err := m.pg.ReplaceTaskLLMProfiles(n, profileIDs, activeProfileID); err != nil {
+	if err := mutation(n); err != nil {
 		return 0, err
 	}
 	pt, err := m.pg.GetTask(n)
@@ -1061,7 +1101,7 @@ func (m *Manager) ReplaceTaskLLMProfiles(id string, profileIDs []int64, activePr
 	}
 	m.mu.Lock()
 	if task := m.tasks[id]; task != nil {
-		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
+		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason, pt)
 	}
 	m.mu.Unlock()
 	// 终态任务不重开额度阻塞意图:任务已经没有 worker 在跑,重开只会把它们从
@@ -1400,6 +1440,9 @@ func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) 
 		})
 	}
 	m.mu.Unlock()
+	if m.proxyEngine != nil {
+		m.proxyEngine.requestProxyRelease(id, false)
+	}
 	return true, nil
 }
 
@@ -1431,8 +1474,23 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 		})
 	}
 	m.mu.Unlock()
+	if pgdb.IsTerminal(status) && m.proxyEngine != nil {
+		m.proxyEngine.requestProxyRelease(id, false)
+	}
 	return nil
 }
+
+func (m *Manager) releaseTaskProxy(t *Task) error {
+	// 无代理且未启动运行时的测试／离线调用不需要回收；实际运行时错误必须传播。
+	if _, err := m.proxyRuntime(); err != nil && (t == nil || t.ProxySnapshot.ID == 0) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), proxyReleaseTimeout)
+	defer cancel()
+	return m.ReleaseTaskProxyWhenIdle(ctx, t)
+}
+
+const proxyReleaseTimeout = 30 * time.Second
 
 // DeleteTask removes a task and optionally its related global data. Traffic has
 // no task-id column, so related exchanges are resolved by exact hosts from the

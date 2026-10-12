@@ -18,6 +18,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/selfupdate"
 	"github.com/Autumn-27/artex/server"
 )
@@ -95,11 +96,29 @@ func run() int {
 	ctx, shutdown := shutdownContext(sigCtx)
 	defer shutdown(agent.AbortShutdown)
 
+	// 代理密钥独立于 JWT；容器通过独立卷持久化，丢失/损坏时启动失败。
+	secretPath := os.Getenv("ARTEX_PROXY_SECRETS_FILE")
+	if secretPath == "" {
+		secretPath = filepath.Join(*dataDir, "proxy-secrets", "key")
+	}
+	if err := db.ConfigureProxySecrets(secretPath); err != nil {
+		log.Printf("代理密钥配置失败")
+		return 1
+	}
+	if err := db.InitializeProxySecrets(); err != nil {
+		log.Printf("代理密钥初始化失败: %v", err)
+		return 1
+	}
 	mgr, err := server.NewManager(*dataDir, *proxy)
 	if err != nil {
 		log.Fatalf("open stores: %v", err)
 	}
 	defer mgr.Close()
+	if err := mgr.InitProxyRuntime(ctx); err != nil {
+		log.Printf("代理运行时初始化失败: %v", err)
+		return 1
+	}
+	defer mgr.CloseProxyRuntime()
 
 	// Surviving this long means a freshly swapped-in build actually works, so drop
 	// the upgrade marker and stop counting attempts. Until it fires, every boot

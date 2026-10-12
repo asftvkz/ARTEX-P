@@ -22,7 +22,7 @@ import (
 // hostTools, if set, returns runtime host tools (currently the traffic tools when
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
-func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
+func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string), managers ...*Manager) {
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		a, err := pg.GetAgentByKey(agentKey)
 		if err != nil || a == nil {
@@ -82,6 +82,19 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 				skillGated := gated[m.Name]
 				if !directVisible && !skillGated {
 					continue // neither directly visible nor referenced by a visible skill
+				}
+				if len(managers) > 0 {
+					resolved, err := managers[0].TaskMCPConfig(ctx, m)
+					if err != nil {
+						// 只返回明确错误工具，绝不启动未解析的共享浏览器配置。
+						for _, closer := range closers {
+							_ = closer.Close()
+						}
+						return []actool.CoreTool{roTool("task_proxy_error", "任务代理配置失败，浏览器不可用", objSchema(map[string]any{}), func(context.Context, json.RawMessage) (actool.Result, error) {
+							return actool.Errorf("任务代理解析失败，无法启动浏览器"), nil
+						})}, agent.DeferredInfo{}, nil
+					}
+					m = resolved
 				}
 				cl, err := connectMCP(ctx, m)
 				if err != nil {

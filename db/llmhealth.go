@@ -9,6 +9,7 @@ import "time"
 // LLMHealth is one profile's circuit-breaker state.
 type LLMHealth struct {
 	ProfileID int64      `json:"profile_id"`
+	ModelID   int64      `json:"model_id"`
 	Fails     int        `json:"fails"`      // consecutive failures; cleared on success
 	Trips     int        `json:"trips"`      // total trips, drives the backoff ladder
 	OpenUntil *time.Time `json:"open_until"` // nil/past = closed (healthy)
@@ -21,8 +22,8 @@ type LLMHealth struct {
 // finished cooling should be treated as healthy again and re-probed on its next
 // call, not resurrected as broken.
 func (d *DB) LoadLLMHealth() ([]LLMHealth, error) {
-	rows, err := d.Query(`SELECT profile_id,fails,trips,open_until,COALESCE(last_error,''),last_at
-FROM llm_profile_health WHERE open_until IS NOT NULL AND open_until > now()`)
+	rows, err := d.Query(`SELECT profile_id,model_id,fails,trips,open_until,COALESCE(last_error,''),last_at
+FROM llm_model_health WHERE open_until IS NOT NULL AND open_until > now()`)
 	if err != nil {
 		return nil, err
 	}
@@ -30,7 +31,7 @@ FROM llm_profile_health WHERE open_until IS NOT NULL AND open_until > now()`)
 	var out []LLMHealth
 	for rows.Next() {
 		var h LLMHealth
-		if err := rows.Scan(&h.ProfileID, &h.Fails, &h.Trips, &h.OpenUntil, &h.LastError, &h.LastAt); err != nil {
+		if err := rows.Scan(&h.ProfileID, &h.ModelID, &h.Fails, &h.Trips, &h.OpenUntil, &h.LastError, &h.LastAt); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -41,17 +42,22 @@ FROM llm_profile_health WHERE open_until IS NOT NULL AND open_until > now()`)
 // SaveLLMHealth upserts one profile's circuit-breaker state.
 func (d *DB) SaveLLMHealth(h LLMHealth) error {
 	_, err := d.Exec(`
-INSERT INTO llm_profile_health(profile_id,fails,trips,open_until,last_error,last_at)
-VALUES ($1,$2,$3,$4,$5,now())
-ON CONFLICT (profile_id) DO UPDATE SET
+INSERT INTO llm_model_health(profile_id,model_id,fails,trips,open_until,last_error,last_at)
+VALUES ($1,$6,$2,$3,$4,$5,now())
+ON CONFLICT (profile_id,model_id) DO UPDATE SET
   fails=EXCLUDED.fails, trips=EXCLUDED.trips, open_until=EXCLUDED.open_until,
   last_error=EXCLUDED.last_error, last_at=now()`,
-		h.ProfileID, h.Fails, h.Trips, h.OpenUntil, h.LastError)
+		h.ProfileID, h.Fails, h.Trips, h.OpenUntil, h.LastError, h.ModelID)
 	return err
 }
 
 // ClearLLMHealth drops one profile's state (manual "recover now" from the UI).
 func (d *DB) ClearLLMHealth(profileID int64) error {
-	_, err := d.Exec(`DELETE FROM llm_profile_health WHERE profile_id=$1`, profileID)
+	_, err := d.Exec(`DELETE FROM llm_model_health WHERE $1=0 OR profile_id=$1`, profileID)
+	return err
+}
+
+func (d *DB) ClearLLMModelHealth(profileID, modelID int64) error {
+	_, err := d.Exec(`DELETE FROM llm_model_health WHERE profile_id=$1 AND model_id=$2`, profileID, modelID)
 	return err
 }

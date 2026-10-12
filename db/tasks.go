@@ -28,16 +28,18 @@ type Task struct {
 	LLMProfileID  *int64     `json:"llm_profile_id,omitempty"`
 	// Task-level ordered LLM chain. LLMProfileID remains the compatibility alias
 	// for ActiveLLMProfileID while older API clients still send one profile id.
-	LLMProfileIDs      []int64    `json:"llm_profile_ids,omitempty"`
-	ActiveLLMProfileID *int64     `json:"active_llm_profile_id,omitempty"`
-	LLMChainRevision   int64      `json:"-"`
-	LLMFailoverState   string     `json:"llm_failover_state,omitempty"`
-	LLMFailoverReason  string     `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []int64    `json:"source_task_ids,omitempty"`
-	CompanyIDs         []int64    `json:"company_ids,omitempty"`
-	ParentRef          string     `json:"parent_ref,omitempty"` // 父任务 id(编排 spawn 记录;空=顶层)
-	CreatedAt          time.Time  `json:"created_at"`
-	CompletedAt        *time.Time `json:"completed_at,omitempty"` // 进入终态(done/failed/timeout)的时刻;非终态为 nil
+	LLMProfileIDs      []int64             `json:"llm_profile_ids,omitempty"`
+	LLMMembers         []LLMModelSelection `json:"llm_members,omitempty"`
+	ActiveLLMPosition  *int                `json:"active_llm_position,omitempty"`
+	ActiveLLMProfileID *int64              `json:"active_llm_profile_id,omitempty"`
+	LLMChainRevision   int64               `json:"-"`
+	LLMFailoverState   string              `json:"llm_failover_state,omitempty"`
+	LLMFailoverReason  string              `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs      []int64             `json:"source_task_ids,omitempty"`
+	CompanyIDs         []int64             `json:"company_ids,omitempty"`
+	ParentRef          string              `json:"parent_ref,omitempty"` // 父任务 id(编排 spawn 记录;空=顶层)
+	CreatedAt          time.Time           `json:"created_at"`
+	CompletedAt        *time.Time          `json:"completed_at,omitempty"` // 进入终态(done/failed/timeout)的时刻;非终态为 nil
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。
 	TimeoutSeconds int        `json:"timeout_seconds"`        // 0=不限时
 	FirstRunAt     *time.Time `json:"first_run_at,omitempty"` // 首次真正开始运行的时刻(非 created_at);nil=尚未运行
@@ -49,7 +51,10 @@ type Task struct {
 	// 覆盖度、不自动累积 task_scope(source=auto)、不给 agent 开放 add_task_scope/
 	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
-	CoverageEnabled bool `json:"coverage_enabled"`
+	CoverageEnabled bool          `json:"coverage_enabled"`
+	ProxyMode       TaskProxyMode `json:"proxy_mode"`
+	ProxyID         *int64        `json:"proxy_id,omitempty"`
+	ProxySnapshot   ProxySnapshot `json:"proxy_snapshot,omitempty"`
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -149,18 +154,31 @@ type TaskCreateOptions struct {
 	SourceTaskIDs        []int64
 	CompanyIDs           []int64
 	LLMProfileIDs        []int64
+	LLMMembers           []LLMModelSelection
 	TimeoutSeconds       int
 	PlanHeartbeatSeconds int
 	// CoverageEnabled 是「资产覆盖度功能」开关;nil=默认开(true)，让不关心该开关的创建
 	// 路径(编排 spawn、老 API)沿用原行为。仅 web 创建任务时可显式传 false 关闭。
 	CoverageEnabled *bool
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
-	InterceptRules []TaskInterceptRuleInput
+	InterceptRules    []TaskInterceptRuleInput
+	ProxyMode         TaskProxyMode
+	ProxyID           *int64
+	ProxySnapshot     ProxySnapshot
+	ProxyParentTaskID *int64 // 编排子任务在同事务继承父任务权威快照，HTTP不能直接提供
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
 // and the ordered task LLM chain in one transaction.
 func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOptions) (*Task, error) {
+	if opts.LLMMembers != nil {
+		opts.LLMProfileIDs = nil
+		for _, member := range opts.LLMMembers {
+			opts.LLMProfileIDs = append(opts.LLMProfileIDs, member.ProfileID)
+		}
+	} else {
+		opts.LLMMembers = selectionsFromProfiles(opts.LLMProfileIDs)
+	}
 	if len(opts.SourceTaskIDs) > MaxTaskSourceCount {
 		return nil, fmt.Errorf("too many source tasks: got %d, maximum is %d", len(opts.SourceTaskIDs), MaxTaskSourceCount)
 	}
@@ -174,6 +192,9 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := lockProxyLifecycle(tx); err != nil {
+		return nil, err
+	}
 	var expID int64
 	if err := tx.QueryRow(`INSERT INTO explorations(description, goal) VALUES ($1,$2) RETURNING id`, description, goal).Scan(&expID); err != nil {
 		return nil, err
@@ -215,6 +236,73 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		id := opts.LLMProfileIDs[0]
 		active = &id
 	}
+	inheritSnapshot := opts.ProxyParentTaskID != nil
+	if inheritSnapshot {
+		var raw []byte
+		if err := tx.QueryRow(`SELECT COALESCE(proxy_mode,'inherit'),proxy_id,COALESCE(proxy_snapshot,'{}'::jsonb) FROM tasks WHERE id=$1 AND deleted_at IS NULL FOR SHARE`, *opts.ProxyParentTaskID).Scan(&opts.ProxyMode, &opts.ProxyID, &raw); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(raw, &opts.ProxySnapshot); err != nil {
+			return nil, ErrProxyUnavailable
+		}
+	}
+	proxyMode, err := NormalizeTaskProxyMode(opts.ProxyMode)
+	if err != nil {
+		return nil, err
+	}
+	var selected *Proxy
+	if inheritSnapshot && proxyMode != TaskProxyModeDirect {
+		id := opts.ProxySnapshot.ID
+		if opts.ProxyID != nil {
+			if id != 0 && id != *opts.ProxyID {
+				return nil, ErrProxyUnavailable
+			}
+			id = *opts.ProxyID
+		}
+		if id > 0 {
+			selected, err = getProxyTx(tx, id)
+			if err != nil {
+				return nil, err
+			}
+		} else if proxyMode == TaskProxyModeFixed {
+			return nil, ErrProxyUnavailable
+		}
+	} else if proxyMode == TaskProxyModeFixed {
+		if opts.ProxyID == nil || *opts.ProxyID <= 0 {
+			return nil, ErrProxyIDRequired
+		}
+		selected, err = getProxyTx(tx, *opts.ProxyID)
+		if err != nil {
+			return nil, err
+		}
+	} else if proxyMode == TaskProxyModeInherit {
+		gid, gerr := globalProxyIDTx(tx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if gid != nil {
+			selected, err = getProxyTx(tx, *gid)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if selected != nil {
+		if err := usableProxy(selected); err != nil {
+			return nil, err
+		}
+		if !inheritSnapshot {
+			snap, serr := selected.SnapshotEncrypted()
+			if serr != nil {
+				return nil, serr
+			}
+			opts.ProxySnapshot = snap
+		}
+		opts.ProxyID = &selected.ID
+	} else {
+		opts.ProxyID = nil
+		opts.ProxySnapshot = ProxySnapshot{}
+	}
 	t := &Task{
 		Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
 		Description: description, Goal: goal, ExplorationID: expID,
@@ -224,11 +312,19 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
 		CoverageEnabled: coverageEnabled,
+		ProxyMode:       proxyMode,
+		ProxyID:         opts.ProxyID,
+		ProxySnapshot:   opts.ProxySnapshot,
+	}
+	t.ProxyMode = proxyMode
+	proxyJSON, err := json.Marshal(opts.ProxySnapshot)
+	if err != nil {
+		return nil, err
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, proxy_mode, proxy_id, proxy_snapshot)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12)
+	RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, proxyMode, opts.ProxyID, string(proxyJSON)).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -237,8 +333,16 @@ RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, descripti
 	if err := insertTaskCompanies(tx, t.ID, opts.CompanyIDs); err != nil {
 		return nil, err
 	}
-	if err := insertTaskLLMProfiles(tx, t.ID, opts.LLMProfileIDs); err != nil {
+	if err := insertTaskLLMMembers(tx, t.ID, opts.LLMMembers); err != nil {
 		return nil, err
+	}
+	t.LLMMembers = opts.LLMMembers
+	if len(opts.LLMMembers) > 0 {
+		position := 0
+		t.ActiveLLMPosition = &position
+		if _, err := tx.Exec(`UPDATE tasks SET active_llm_position=0 WHERE id=$1`, t.ID); err != nil {
+			return nil, err
+		}
 	}
 	if err := insertTaskInterceptRules(tx, t.ID, opts.InterceptRules); err != nil {
 		return nil, err
@@ -329,27 +433,23 @@ SELECT $1, id FROM tasks WHERE id=$2 AND deleted_at IS NULL`, taskID, sourceID)
 }
 
 func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
-	seen := map[int64]bool{}
-	for position, profileID := range profileIDs {
-		if profileID <= 0 || seen[profileID] {
-			return fmt.Errorf("invalid or duplicate LLM profile id %d", profileID)
-		}
-		seen[profileID] = true
-		if _, err := tx.Exec(`INSERT INTO task_llm_profiles(task_id, profile_id, position) VALUES ($1,$2,$3)`, taskID, profileID, position); err != nil {
-			return err
-		}
-	}
-	return nil
+	return insertTaskLLMMembers(tx, taskID, selectionsFromProfiles(profileIDs))
 }
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(proxy_mode,'inherit'), proxy_id, COALESCE(proxy_snapshot,'{}'::jsonb)`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	var proxySnapshot []byte
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.ProxyMode, &t.ProxyID, &proxySnapshot); err != nil {
 		return nil, err
+	}
+	if len(proxySnapshot) > 0 {
+		if err := json.Unmarshal(proxySnapshot, &t.ProxySnapshot); err != nil {
+			return nil, fmt.Errorf("decode task proxy snapshot: %w", err)
+		}
 	}
 	t.Pinned = t.PinnedAt != nil
 	return &t, nil

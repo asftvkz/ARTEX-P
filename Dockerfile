@@ -26,6 +26,7 @@ ARG TARGETARCH
 ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY norma/ ./norma/
 RUN go mod download
 COPY . .
 # 前端静态产物从 web 阶段拷入（.dockerignore 已排除宿主 dist，不会冲突）
@@ -34,6 +35,7 @@ RUN CGO_ENABLED=0 GOARCH="${TARGETARCH}" go build -tags embedui -trimpath -o /ou
 
 ########## 阶段 3：运行镜像（同原版：工具 + Playwright 预装）##########
 FROM python:3.12-slim-bookworm
+ARG TARGETARCH
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 # 运行层的全局 npm 装包与 chromium 下载同样走国内源（对全球网络同样可达）
 ENV npm_config_registry=$NPM_REGISTRY \
@@ -55,6 +57,11 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
+# 固定版本及 SHA256 校验 wgcf/wireproxy，避免运行未验证的工具资产。
+COPY egress/install.py egress/dependencies.json /tmp/wgcf-warp/
+RUN python /tmp/wgcf-warp/install.py "${TARGETARCH}" /usr/local/bin \
+    && chmod 0755 /usr/local/bin/wgcf /usr/local/bin/wireproxy \
+    && rm -rf /tmp/wgcf-warp
 WORKDIR /app
 # 构建阶段产出的单二进制（内嵌前端）
 COPY --from=gobuild /out/artex /app/artex
@@ -65,7 +72,8 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/artex /app/start.sh
 COPY skills/ /app/skills/
 # data/（SQLite + jwt.key）持久化点
-VOLUME ["/app/data"]
+VOLUME ["/app/data", "/app/proxy-secrets"]
+ENV ARTEX_PROXY_SECRETS_FILE=/app/proxy-secrets/key
 EXPOSE 8787 8788
 ENTRYPOINT ["/app/start.sh"]
 CMD ["-addr", ":8787", "-proxy", ":8788"]

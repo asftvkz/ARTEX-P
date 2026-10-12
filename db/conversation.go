@@ -54,6 +54,8 @@ type Conversation struct {
 	AgentKey     string     `json:"agent_key"`
 	Title        string     `json:"title"`
 	LLMProfileID *int64     `json:"llm_profile_id,omitempty"`
+	LLMModelMode string     `json:"model_mode"`
+	LLMModelID   *int64     `json:"model_id"`
 	Pinned       bool       `json:"pinned"`
 	PinnedAt     *time.Time `json:"pinned_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
@@ -66,12 +68,12 @@ type ConversationPatch struct {
 	Pinned *bool
 }
 
-const convCols = `id, agent_key, title, llm_profile_id, pinned_at, created_at, updated_at`
+const convCols = `id, agent_key, title, llm_profile_id, pinned_at, created_at, updated_at, llm_model_mode, llm_model_id`
 
 func scanConv(row interface{ Scan(...any) error }) (Conversation, error) {
 	var c Conversation
 	var pinnedAt sql.NullTime
-	err := row.Scan(&c.ID, &c.AgentKey, &c.Title, &c.LLMProfileID, &pinnedAt, &c.CreatedAt, &c.UpdatedAt)
+	err := row.Scan(&c.ID, &c.AgentKey, &c.Title, &c.LLMProfileID, &pinnedAt, &c.CreatedAt, &c.UpdatedAt, &c.LLMModelMode, &c.LLMModelID)
 	if pinnedAt.Valid {
 		c.Pinned = true
 		c.PinnedAt = &pinnedAt.Time
@@ -82,6 +84,14 @@ func scanConv(row interface{ Scan(...any) error }) (Conversation, error) {
 // CreateConversation opens a new chat thread for agentKey with an initial title.
 // llmProfileID may be nil to use the globally active profile.
 func (d *DB) CreateConversation(agentKey, title string, llmProfileID *int64) (*Conversation, error) {
+	var selection *LLMModelSelection
+	if llmProfileID != nil {
+		selection = &LLMModelSelection{ProfileID: *llmProfileID}
+	}
+	return d.CreateConversationSelection(agentKey, title, selection)
+}
+
+func (d *DB) CreateConversationSelection(agentKey, title string, selection *LLMModelSelection) (*Conversation, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return nil, err
@@ -97,12 +107,12 @@ RETURNING `+convCols, agentKey, title))
 	if err != nil {
 		return nil, err
 	}
-	if err := lockLLMProfileForReference(tx, llmProfileID); err != nil {
+	if err := lockLLMSelection(tx, selection); err != nil {
 		return nil, err
 	}
-	if llmProfileID != nil {
-		c, err = scanConv(tx.QueryRow(`UPDATE conversations SET llm_profile_id=$2
-WHERE id=$1 RETURNING `+convCols, c.ID, llmProfileID))
+	if selection != nil {
+		c, err = scanConv(tx.QueryRow(`UPDATE conversations SET llm_profile_id=$2,llm_model_mode=$3,llm_model_id=$4
+WHERE id=$1 RETURNING `+convCols, c.ID, selection.ProfileID, selection.Normalized().ModelMode, selection.ModelID))
 		if err != nil {
 			return nil, err
 		}
@@ -115,6 +125,14 @@ WHERE id=$1 RETURNING `+convCols, c.ID, llmProfileID))
 
 // UpdateConversationProfile sets (or clears) the LLM profile override for a conversation.
 func (d *DB) UpdateConversationProfile(id int64, llmProfileID *int64) error {
+	var selection *LLMModelSelection
+	if llmProfileID != nil {
+		selection = &LLMModelSelection{ProfileID: *llmProfileID}
+	}
+	return d.UpdateConversationSelection(id, selection)
+}
+
+func (d *DB) UpdateConversationSelection(id int64, selection *LLMModelSelection) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
@@ -129,10 +147,11 @@ func (d *DB) UpdateConversationProfile(id int64, llmProfileID *int64) error {
 		}
 		return err
 	}
-	if err := lockLLMProfileForReference(tx, llmProfileID); err != nil {
+	if err := lockLLMSelection(tx, selection); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE conversations SET llm_profile_id=$2 WHERE id=$1`, id, llmProfileID); err != nil {
+	profileID, mode, modelID := selectionColumns(selection)
+	if _, err := tx.Exec(`UPDATE conversations SET llm_profile_id=$2,llm_model_mode=$3,llm_model_id=$4 WHERE id=$1`, id, profileID, mode, modelID); err != nil {
 		return err
 	}
 	return tx.Commit()

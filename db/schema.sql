@@ -359,6 +359,51 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- =====================================================================
+-- C1. 统一代理中心
+-- =====================================================================
+-- 代理表先于任务表创建，保证首次初始化的外键引用有效。
+CREATE TABLE IF NOT EXISTS outbound_proxies (
+    id                 BIGSERIAL PRIMARY KEY,
+    name               TEXT NOT NULL,
+    kind               TEXT NOT NULL CHECK (kind IN ('http','https','socks5','warp','resin')),
+    protocol           TEXT NOT NULL DEFAULT '',
+    url                TEXT NOT NULL DEFAULT '',
+    host               TEXT NOT NULL DEFAULT '',
+    port               INTEGER NOT NULL DEFAULT 0 CHECK (port BETWEEN 0 AND 65535),
+    username           TEXT NOT NULL DEFAULT '',
+    password           TEXT NOT NULL DEFAULT '',
+    resin_platform     TEXT NOT NULL DEFAULT '',
+    resin_admin_url    TEXT NOT NULL DEFAULT '',
+    resin_admin_token  TEXT NOT NULL DEFAULT '',
+    enabled            BOOLEAN NOT NULL DEFAULT true,
+    status             TEXT NOT NULL DEFAULT 'unknown'
+                       CHECK (status IN ('unknown','healthy','failed','starting','stopped')),
+    last_error         TEXT NOT NULL DEFAULT '',
+    last_checked_at    TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_proxies_enabled ON outbound_proxies(enabled, status);
+DROP TRIGGER IF EXISTS trg_outbound_proxies_upd ON outbound_proxies;
+CREATE TRIGGER trg_outbound_proxies_upd BEFORE UPDATE ON outbound_proxies
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS url TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS host TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS port INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS resin_platform TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS resin_admin_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS resin_admin_token TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbound_proxies ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+
+
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
@@ -558,6 +603,11 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_chain_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+-- 任务代理选择：mode=inherit/direct/fixed；proxy_snapshot 固定运行时出口。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS proxy_mode TEXT NOT NULL DEFAULT 'inherit';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS proxy_id BIGINT REFERENCES outbound_proxies(id) ON DELETE SET NULL;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS proxy_snapshot JSONB NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_tasks_proxy_id ON tasks(proxy_id) WHERE proxy_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)

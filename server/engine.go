@@ -137,20 +137,23 @@ type Engine struct {
 	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
 
 	// 任务级超时(见 docs/任务级超时与收尾设计.md):
-	settling     sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
-	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
-	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
-	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
-	coordStarted sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
+	settling      sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
+	deadline      sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
+	stamped       sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
+	inflight      sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
+	proxyBarriers sync.Map // taskID -> *taskProxyBarrier
+	coordStarted  sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
 
 	// resolve returns a task's dedicated planner/worker (wired by the server as the
 	// authoritative task-router). nil,nil means this task is deliberately unavailable
 	// (for example an exhausted failover chain) — there is no global-pair fallback.
 	resolve              func(t *Task) (*agent.Planner, *agent.Worker)
+	resolveContext       func(context.Context, *Task) (*agent.Planner, *agent.Worker)
 	resolveAuthoritative bool
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
-	readiness func() bool
+	readiness     func() bool
+	taskReadiness func(*Task) bool
 }
 
 type taskRuntime struct {
@@ -178,6 +181,7 @@ func (e *Engine) nextPlannerRound(taskID string) int {
 func (e *Engine) Pause(taskID string, cause error) {
 	e.paused.Store(taskID, true)
 	e.cancelExec(taskID, cause)
+	e.requestProxyRelease(taskID, false)
 }
 
 // BeginDelete installs an execution barrier before task data/files are removed.
@@ -387,10 +391,14 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
 func NewEngine(m *Manager) *Engine {
-	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
+	e := &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
 		runtimes: map[string]*taskRuntime{}}
+	if m != nil {
+		m.proxyEngine = e
+	}
+	return e
 }
 
 // registerWork records the cancel for the work currently running intentID.
@@ -703,6 +711,8 @@ func (e *Engine) SetReadiness(fn func() bool) { e.readiness = fn }
 // SetAgentResolver installs a per-task planner/worker resolver (wired by the server).
 // Called once at startup before any task loop runs, so no lock is needed on reads.
 func (e *Engine) SetAgentResolver(fn func(t *Task) (*agent.Planner, *agent.Worker)) {
+	e.resolveContext = nil
+	e.taskReadiness = nil
 	e.resolve = fn
 	e.resolveAuthoritative = false
 }
@@ -711,6 +721,8 @@ func (e *Engine) SetAgentResolver(fn func(t *Task) (*agent.Planner, *agent.Worke
 // fall through to the global provider. Task-level failover chains use this so a
 // fully exhausted chain cannot silently bypass its configured boundary.
 func (e *Engine) SetAuthoritativeAgentResolver(fn func(t *Task) (*agent.Planner, *agent.Worker)) {
+	e.resolveContext = nil
+	e.taskReadiness = nil
 	e.resolve = fn
 	e.resolveAuthoritative = true
 }
@@ -718,7 +730,10 @@ func (e *Engine) SetAuthoritativeAgentResolver(fn func(t *Task) (*agent.Planner,
 // snapshotFor returns the planner/worker a task should run on, from the task-router
 // resolver. nil,nil means the task is deliberately unavailable (e.g. an exhausted
 // failover chain); there is no global-pair fallback.
-func (e *Engine) snapshotFor(t *Task) (*agent.Planner, *agent.Worker) {
+func (e *Engine) snapshotFor(t *Task, contexts ...context.Context) (*agent.Planner, *agent.Worker) {
+	if e.resolveContext != nil && len(contexts) > 0 {
+		return e.resolveContext(contexts[0], t)
+	}
 	if e.resolve != nil {
 		p, w := e.resolve(t)
 		if (p != nil && w != nil) || e.resolveAuthoritative {
@@ -738,6 +753,13 @@ func (e *Engine) Ready() bool {
 // An explicit task profile chain can be runnable even when no global default
 // provider is configured, so task status must not rely on Ready alone.
 func (e *Engine) ReadyFor(t *Task) bool {
+	if !e.beginTaskOperation(t.ID) {
+		return false
+	}
+	defer e.decInflight(t.ID)
+	if e.taskReadiness != nil {
+		return e.taskReadiness(t)
+	}
 	p, w := e.snapshotFor(t)
 	return p != nil && w != nil
 }
@@ -759,6 +781,11 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
 	e.deleteMu.RUnlock()
+	go func() {
+		<-rt.ctx.Done()
+		rt.wg.Wait()
+		e.requestProxyRelease(t.ID, true)
+	}()
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
 	for i := 0; i < workers; i++ {
@@ -807,6 +834,11 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 
 	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
 	runRound := func(src string) {
+		opCtx, finish, admitted := e.beginTaskOperationContext(e.execContextFor(ctx, t.ID), t.ID)
+		if !admitted {
+			return
+		}
+		defer finish()
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
 	drain:
@@ -817,7 +849,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				break drain
 			}
 		}
-		planner, _ := e.snapshotFor(t)
+		planner, _ := e.snapshotFor(t, opCtx)
 		if planner == nil {
 			return // idle until LLM configured
 		}
@@ -856,14 +888,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			}
 			return // goalless 分支永不进入 planner.Plan
 		}
-		if !e.beginTaskOperation(t.ID) {
-			return
-		}
-		defer e.decInflight(t.ID)
 		e.stampFirstRun(t) // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 		e.touch(t.ID)
 		emit := func(r db.Activity) { e.emitActivity(t, r) }
-		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
+		ectx := e.clockCtx(opCtx, t, false) // 准入凭证和取消信号覆盖整轮工具执行
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
@@ -920,13 +948,6 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			return
 		default:
 		}
-		_, worker := e.snapshotFor(t)
-		if worker == nil {
-			if sleepCtx(ctx, 1500*time.Millisecond) {
-				return
-			}
-			continue
-		}
 		if e.IsPaused(t.ID) {
 			if sleepCtx(ctx, 1000*time.Millisecond) {
 				return
@@ -948,11 +969,20 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
 		}
-		if !e.beginTaskOperation(t.ID) {
+		opCtx, finish, admitted := e.beginTaskOperationContext(e.execContextFor(ctx, t.ID), t.ID)
+		if !admitted {
 			return
 		}
-		claimed := e.runWorkerStep(ctx, t, name, worker)
-		e.decInflight(t.ID)
+		_, worker := e.snapshotFor(t, opCtx)
+		if worker == nil {
+			finish()
+			if sleepCtx(ctx, 1500*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		claimed := e.runWorkerStep(opCtx, t, name, worker)
+		finish()
 		if !claimed && sleepCtx(ctx, 800*time.Millisecond) {
 			return
 		}
@@ -984,7 +1014,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
-	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
+	ectx := e.clockCtx(e.taskExecutionContext(ctx, t.ID), t, false)
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 领取后回退失败: %v", name, t.ID, intent.ID, err)
@@ -1169,16 +1199,17 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 // task pause/delete/shutdown still stops it). Returns an error if the run could not
 // be started; the intent is left untouched in that case.
 func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64, requestID, message, agentMessage string) error {
-	if !e.beginTaskOperation(t.ID) {
+	opCtx, finish, admitted := e.beginTaskOperationContext(e.execContextFor(ctx, t.ID), t.ID)
+	if !admitted {
 		return fmt.Errorf("task is being deleted")
 	}
 	release := true
 	defer func() {
 		if release {
-			e.decInflight(t.ID)
+			finish()
 		}
 	}()
-	_, worker := e.snapshotFor(t)
+	_, worker := e.snapshotFor(t, opCtx)
 	if worker == nil {
 		return fmt.Errorf("worker 尚未就绪")
 	}
@@ -1205,8 +1236,8 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	e.emitActivity(t, db.Activity{NodeID: &uid, Worker: "user", Kind: "user", Summary: message, Detail: message})
 	release = false // ownership of the admission passes to the goroutine
 	go func() {
-		defer e.decInflight(t.ID)
-		e.runIntent(ctx, t, "chat", worker, node, requestID, agentMessage)
+		defer finish()
+		e.runIntent(opCtx, t, "chat", worker, node, requestID, agentMessage)
 	}()
 	return nil
 }

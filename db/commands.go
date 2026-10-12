@@ -128,22 +128,26 @@ LIMIT $` + fmt.Sprintf("%d", argN) + ` OFFSET $` + fmt.Sprintf("%d", argN+1)
 
 // LLMRecord is one recorded LLM API call (request + response).
 type LLMRecord struct {
-	ID           int64     `json:"id"`
-	Ts           time.Time `json:"ts"`
-	Model        string    `json:"model"`
-	ProfileName  string    `json:"profile_name"`
-	SessionID    string    `json:"session_id"`
-	TaskID       string    `json:"task_id"`
-	Worker       string    `json:"worker"`
-	LatencyMs    int       `json:"latency_ms"`
-	InputTokens  int       `json:"input_tokens"`
-	OutputTokens int       `json:"output_tokens"`
-	CacheRead    int       `json:"cache_read"`
-	CacheWrite   int       `json:"cache_write"`
-	Status       string    `json:"status"`
-	Error        string    `json:"error,omitempty"`
-	RequestBody  string    `json:"request_body,omitempty"`
-	ResponseBody string    `json:"response_body,omitempty"`
+	ProfileID       int64     `json:"profile_id,string,omitempty"`
+	ModelID         int64     `json:"model_id,string,omitempty"`
+	MemberKey       string    `json:"member_key,omitempty"`
+	UpstreamModelID string    `json:"upstream_model_id,omitempty"`
+	ID              int64     `json:"id"`
+	Ts              time.Time `json:"ts"`
+	Model           string    `json:"model"`
+	ProfileName     string    `json:"profile_name"`
+	SessionID       string    `json:"session_id"`
+	TaskID          string    `json:"task_id"`
+	Worker          string    `json:"worker"`
+	LatencyMs       int       `json:"latency_ms"`
+	InputTokens     int       `json:"input_tokens"`
+	OutputTokens    int       `json:"output_tokens"`
+	CacheRead       int       `json:"cache_read"`
+	CacheWrite      int       `json:"cache_write"`
+	Status          string    `json:"status"`
+	Error           string    `json:"error,omitempty"`
+	RequestBody     string    `json:"request_body,omitempty"`
+	ResponseBody    string    `json:"response_body,omitempty"`
 	// RawRequest / RawResponse are the untouched HTTP bodies exchanged with the
 	// provider — the request as buildBody() sent it (full tool schemas included)
 	// and the raw SSE frames. RequestBody/ResponseBody above are the normalized
@@ -185,6 +189,10 @@ ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS worker TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS profile_name TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_request TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_response TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS profile_id BIGINT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS model_id BIGINT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS member_key TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS upstream_model_id TEXT;
 `
 
 // EnsureLLMRecordsTable creates the llm_records table if it does not exist.
@@ -209,12 +217,12 @@ func (d *DB) EnsureLLMRecordsTable() error {
 // InsertLLMRecord stores one LLM call record.
 func (d *DB) InsertLLMRecord(r *LLMRecord) error {
 	_, err := d.Exec(`
-INSERT INTO llm_records(model, profile_name, session_id, task_id, worker, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, error, request_body, response_body, raw_request, raw_response)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+INSERT INTO llm_records(model, profile_name, session_id, task_id, worker, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, error, request_body, response_body, raw_request, raw_response,profile_id,model_id,member_key,upstream_model_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NULLIF($17,0),NULLIF($18,0),NULLIF($19,''),NULLIF($20,''))`,
 		r.Model, nullIfEmpty(r.ProfileName), r.SessionID, nullIfEmpty(r.TaskID), nullIfEmpty(r.Worker),
 		r.LatencyMs, r.InputTokens, r.OutputTokens, r.CacheRead, r.CacheWrite,
 		r.Status, nullIfEmpty(r.Error), nullIfEmpty(r.RequestBody), nullIfEmpty(r.ResponseBody),
-		nullIfEmpty(r.RawRequest), nullIfEmpty(r.RawResponse))
+		nullIfEmpty(r.RawRequest), nullIfEmpty(r.RawResponse), r.ProfileID, r.ModelID, r.MemberKey, r.UpstreamModelID)
 	return err
 }
 
@@ -254,7 +262,7 @@ func (d *DB) ListLLMRecords(model, session, task string, page, size int) ([]LLMR
 
 	dataQ := `SELECT id, ts, COALESCE(model,''), COALESCE(profile_name,''), COALESCE(session_id,''), COALESCE(task_id,''), COALESCE(worker,''),
 		COALESCE(latency_ms,0), COALESCE(input_tokens,0), COALESCE(output_tokens,0), COALESCE(cache_read,0), COALESCE(cache_write,0),
-		COALESCE(status,''), COALESCE(error,'')
+		COALESCE(status,''), COALESCE(error,''),COALESCE(profile_id,0),COALESCE(model_id,0),COALESCE(member_key,''),COALESCE(upstream_model_id,'')
 		FROM llm_records ` + where + ` ORDER BY id DESC LIMIT $` + fmt.Sprintf("%d", argN) + ` OFFSET $` + fmt.Sprintf("%d", argN+1)
 	args = append(args, size, offset)
 
@@ -268,7 +276,7 @@ func (d *DB) ListLLMRecords(model, session, task string, page, size int) ([]LLMR
 	for rows.Next() {
 		var r LLMRecord
 		if err := rows.Scan(&r.ID, &r.Ts, &r.Model, &r.ProfileName, &r.SessionID, &r.TaskID, &r.Worker, &r.LatencyMs,
-			&r.InputTokens, &r.OutputTokens, &r.CacheRead, &r.CacheWrite, &r.Status, &r.Error); err != nil {
+			&r.InputTokens, &r.OutputTokens, &r.CacheRead, &r.CacheWrite, &r.Status, &r.Error, &r.ProfileID, &r.ModelID, &r.MemberKey, &r.UpstreamModelID); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, r)
@@ -330,11 +338,11 @@ func (d *DB) GetLLMRecord(id int64) (*LLMRecord, error) {
 	var reqBody, respBody, rawReq, rawResp sql.NullString
 	err := d.QueryRow(`SELECT id, ts, COALESCE(model,''), COALESCE(profile_name,''), COALESCE(session_id,''), COALESCE(task_id,''), COALESCE(worker,''),
 		COALESCE(latency_ms,0), COALESCE(input_tokens,0), COALESCE(output_tokens,0), COALESCE(cache_read,0), COALESCE(cache_write,0),
-		COALESCE(status,''), COALESCE(error,''), request_body, response_body, raw_request, raw_response
+		COALESCE(status,''), COALESCE(error,''), request_body, response_body, raw_request, raw_response,COALESCE(profile_id,0),COALESCE(model_id,0),COALESCE(member_key,''),COALESCE(upstream_model_id,'')
 		FROM llm_records WHERE id=$1`, id).
 		Scan(&r.ID, &r.Ts, &r.Model, &r.ProfileName, &r.SessionID, &r.TaskID, &r.Worker, &r.LatencyMs,
 			&r.InputTokens, &r.OutputTokens, &r.CacheRead, &r.CacheWrite, &r.Status, &r.Error,
-			&reqBody, &respBody, &rawReq, &rawResp)
+			&reqBody, &respBody, &rawReq, &rawResp, &r.ProfileID, &r.ModelID, &r.MemberKey, &r.UpstreamModelID)
 	if err != nil {
 		return nil, err
 	}
