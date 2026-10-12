@@ -54,12 +54,16 @@ import type {
   InterceptRule,
   JudgeConfig,
   JudgeUsage,
+  LLMActiveMember,
+  LLMModelMode,
+  LLMModelsResponse,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
   LLMRecordItem,
   LLMRetryOverride,
   LLMRetryPolicy,
+  LLMSelection,
   LLMTask,
   MCPServer,
   MCPTool,
@@ -71,6 +75,8 @@ import type {
   NotificationMeta,
   PromptVar,
   PromptVersion,
+  ProxyRecord,
+  ProxyWriteInput,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -253,6 +259,7 @@ export const api = {
     description: string;
     goal: string;
     llmProfileIds?: number[];
+    members?: LLMSelection[]; // 阶段 2：显式渠道+模型候选链；提供时优先，空数组=继承
     sourceTaskIds?: string[];
     companyIds?: number[];
     timeoutSeconds?: number;
@@ -260,13 +267,16 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
+    proxyMode?: "inherit" | "direct" | "fixed";
+    proxyId?: number;
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
       category_id: input.categoryId ?? null,
       description: input.description,
       goal: input.goal,
-      llm_profile_ids: input.llmProfileIds ?? [],
+      // 显式给了 members（哪怕空数组）就走新形态；否则回退旧的渠道 id 列表。
+      ...(input.members !== undefined ? { members: input.members } : { llm_profile_ids: input.llmProfileIds ?? [] }),
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
@@ -274,7 +284,25 @@ export const api = {
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      proxy_mode: input.proxyMode ?? "inherit",
+      proxy_id: input.proxyId ?? null,
     }),
+  proxies: () => get<{ proxies: import("./types").ProxyRecord[]; global_proxy_id: number | null }>("/proxies"),
+  createProxy: (input: ProxyWriteInput) => post<ProxyRecord>("/proxies", input),
+  updateProxy: (id: number, input: ProxyWriteInput) => put<ProxyRecord>(`/proxies/${id}`, input),
+  deleteProxy: (id: number) => del<{ deleted: number }>(`/proxies/${id}`),
+  testProxy: (id: number) => post<ProxyRecord>(`/proxies/${id}/test`),
+  setGlobalProxy: (proxyId: number | null) =>
+    put<{ global_proxy_id: number | null }>("/proxies/global", { proxy_id: proxyId }),
+  // 注册必须先取得产品用户对注册使用条款的明确同意：确认后固定携带
+  // {accept_terms:true}，未确认时调用方不得发起该请求（后端不接受缺失/false）。
+  // start/stop/recover 不涉及条款，不带请求体。
+  proxyWarpAction: (id: number, action: "start" | "stop" | "register" | "recover", acceptTerms?: true) =>
+    post<ProxyRecord>(
+      `/proxies/${id}/warp/${action}`,
+      action === "register" ? { accept_terms: acceptTerms === true } : undefined,
+    ),
+  releaseResin: (id: number) => post<ProxyRecord>(`/proxies/${id}/resin/release`),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
@@ -299,6 +327,23 @@ export const api = {
     input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
+  // 阶段 2：原子替换任务候选链。members 为空数组 = 恢复继承 Agent 绑定/全局配置；
+  // active_position 是零起始下标（省略则选第一项）。
+  updateTaskLLMMembers: (id: string, members: LLMSelection[], activePosition?: number) =>
+    put<{
+      id: string;
+      llm_profile_ids: number[];
+      active_llm_profile_id?: number;
+      members?: LLMSelection[];
+      active_position?: number | null;
+      active_member?: LLMActiveMember | null;
+      llm_failover_state: string;
+      reopened_intents: number;
+      switch_event?: Activity;
+    }>(`/tasks/${id}/llm`, {
+      members,
+      ...(activePosition === undefined ? {} : { active_position: activePosition }),
+    }),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
     put<{
       id: string;
@@ -825,8 +870,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -983,6 +1027,14 @@ export const api = {
   llmPool: () => get<LLMPoolStatus>("/llm/pool"),
   // 清除熔断，让下一次调用立刻重试该配置；不传 id = 全部清除。
   resetLLMPool: (id?: string) => post<LLMPoolStatus>("/llm/pool/reset", { id: id ? Number(id) : 0 }),
+  // 阶段 2 精确恢复：以 member_key("{profile_id}:{model_id}") 只清一个池成员的状态；
+  // 旧的按渠道/全部恢复仍走 resetLLMPool（{id} 语义不变）。
+  resetLLMPoolMember: (memberKey: string) => post<LLMPoolStatus>("/llm/pool/reset", { member_key: memberKey }),
+  // 设置某渠道在全局轮询池里的模型选择：channel-default(跟随该渠道当前默认模型，
+  // 默认变化时下一次解析随之变化) 或 fixed-model(固定某个模型成员，渠道切换默认
+  // 不影响它)。保存后重建全局池；正在进行的调用仍用启动时已解析的成员。
+  setLLMPoolRoute: (profileId: number, mode: LLMModelMode, modelId: string | null) =>
+    put<{ ok: boolean }>(`/llm/pool/routes/${profileId}`, { model_mode: mode, model_id: modelId }),
   // 全局重试策略（五层各自的次数+间隔）。全 0 = 全部走内置默认。
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
@@ -994,6 +1046,19 @@ export const api = {
       proxy,
       profile_id,
     }),
+  // 渠道下的模型成员（子实体）。ID 全部按字符串传递，避免 JS 整数精度问题。
+  llmModels: (profileId: number) => get<LLMModelsResponse>(`/llm/profiles/${profileId}/models`),
+  // 原子替换该渠道的已选成员 + 默认项；新成员省略 id，由服务端分配稳定 id。
+  saveLLMModels: (
+    profileId: number,
+    models: {
+      id?: string;
+      upstream_model_id: string;
+      display_name: string;
+      enabled: boolean;
+      is_default: boolean;
+    }[],
+  ) => put<LLMModelsResponse>(`/llm/profiles/${profileId}/models`, { models }),
 
   // ---- agents ----
   agents: () => get<{ agents: Agent[] }>("/agents").then((r) => arr(r.agents)),
@@ -1007,12 +1072,28 @@ export const api = {
   conversations: () => get<{ conversations: Conversation[] }>("/conversations").then((r) => arr(r.conversations)),
   createConversation: (agent_key: string, title = "", llm_profile_id?: number | null) =>
     post<Conversation>("/conversations", { agent_key, title, llm_profile_id: llm_profile_id ?? null }),
+  // 阶段 2：创建对话时直接带上渠道+模型三元组。selection=null 表示不带覆盖（继承
+  // Agent 绑定再回退全局），此时 profile_id 显式发 null，语义与"清除覆盖"一致。
+  createConversationWithSelection: (agent_key: string, title = "", selection?: LLMSelection | null) =>
+    post<Conversation>("/conversations", {
+      agent_key,
+      title,
+      profile_id: selection ? selection.profile_id : null,
+      model_mode: selection ? selection.model_mode : "channel-default",
+      model_id: selection && selection.model_mode === "fixed-model" ? selection.model_id : null,
+    }),
   updateConversation: (id: number, input: { title?: string; pinned?: boolean }) =>
     patch<Conversation>(`/conversations/${id}`, input),
   renameConversation: (id: number, title: string) => patch<Conversation>(`/conversations/${id}`, { title }),
   pinConversation: (id: number, pinned: boolean) => patch<Conversation>(`/conversations/${id}`, { pinned }),
   updateConversationProfile: (id: number, llm_profile_id: number | null) =>
     patch<{ ok: boolean }>(`/conversations/${id}/profile`, { llm_profile_id }),
+  // 阶段 2：按渠道+模型三元组设置对话覆盖。profile_id:null = 清除覆盖（继承 Agent 绑定，
+  // 再回退全局）；只传 model_mode/model_id 可不换渠道地调整当前渠道的选择。返回 {ok:true}。
+  updateConversationSelection: (
+    id: number,
+    selection: { profile_id?: string | null; model_mode?: LLMModelMode; model_id?: string | null },
+  ) => patch<{ ok: boolean }>(`/conversations/${id}/profile`, selection),
   deleteConversation: (id: number) => del<{ deleted: number }>(`/conversations/${id}`),
   deleteConversations: (ids: number[]) =>
     post<{ items: { id: number; ok: boolean; error?: string }[] }>("/conversations/delete/batch", { ids }),
@@ -1064,6 +1145,11 @@ export const api = {
     key: string,
     patch: {
       llm_profile_id?: number | null; // number=绑定；null=解绑(跟随任务/全局)；缺省=不动
+      // 阶段 2：渠道+模型三元组。profile_id:null=清除绑定；全部省略=保留当前绑定；
+      // 只传模型字段可调整当前渠道的选择。新字段优先于旧 llm_profile_id。
+      profile_id?: string | null;
+      model_mode?: LLMModelMode;
+      model_id?: string | null;
       max_turns?: number;
       run_seconds?: number;
       web_search?: boolean;

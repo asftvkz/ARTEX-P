@@ -20,6 +20,7 @@ import type {
   InterceptAudit,
   InterceptPending,
   InterceptRule,
+  LLMModelsResponse,
   LLMPoolStatus,
   LLMProfile,
   LLMTask,
@@ -28,6 +29,7 @@ import type {
   MissingSkill,
   PromptVar,
   PromptVersion,
+  ProxyRecord,
   SessionTokenUsage,
   Settings,
   SkillCall,
@@ -74,6 +76,20 @@ export const tasks: Task[] = [
     llm_profile_ids: [1, 2],
     active_llm_profile_id: 1,
     llm_failover_state: "ready",
+    // 渠道 1 跟随默认 + 渠道 2 固定成员 #22：演示同一链上两种模式并存。
+    members: [
+      { profile_id: "1", model_mode: "channel-default", model_id: null },
+      { profile_id: "2", model_mode: "fixed-model", model_id: "22" },
+    ],
+    active_position: 0,
+    active_member: {
+      profile_id: "1",
+      model_mode: "channel-default",
+      model_id: "11",
+      upstream_model_id: "claude-opus-4-8",
+      display_name: "Claude Opus 4.8",
+      member_key: "1:11",
+    },
     source_task_ids: [],
     tokens: { input_tokens: 1284500, output_tokens: 96320, cache_read_tokens: 890400, cache_write_tokens: 132000 },
   },
@@ -125,6 +141,17 @@ export const tasks: Task[] = [
     llm_profile_ids: [2, 1],
     active_llm_profile_id: 2,
     llm_failover_state: "ready",
+    // 渠道 2 固定成员 #22：固定选择不随渠道默认变化。
+    members: [{ profile_id: "2", model_mode: "fixed-model", model_id: "22" }],
+    active_position: 0,
+    active_member: {
+      profile_id: "2",
+      model_mode: "fixed-model",
+      model_id: "22",
+      upstream_model_id: "deepseek-r1",
+      display_name: "deepseek-r1",
+      member_key: "2:22",
+    },
     source_task_ids: ["t-acme-web", "t-acme-api"],
     tokens: { input_tokens: 233000, output_tokens: 18700, cache_read_tokens: 120000, cache_write_tokens: 22000 },
   },
@@ -151,7 +178,13 @@ export const tasks: Task[] = [
     llm_profile_id: 1,
     llm_profile_ids: [1],
     active_llm_profile_id: 1,
-    llm_failover_state: "ready",
+    llm_failover_state: "chain_exhausted",
+    llm_failover_reason: "演示数据：所有已选配置均被判定为额度不足，链已耗尽。",
+    // 链已耗尽：active_position/active_member 都是 null。界面必须如实显示"无生效成员"，
+    // 绝不能把第一项当成当前生效——这正是 resolveActivePosition(null) 返回 null 的场景。
+    members: [{ profile_id: "1", model_mode: "channel-default", model_id: null }],
+    active_position: null,
+    active_member: null,
     source_task_ids: [],
     tokens: { input_tokens: 512000, output_tokens: 40100, cache_read_tokens: 300000, cache_write_tokens: 41000 },
   },
@@ -3045,6 +3078,61 @@ export const llmProfiles: LLMProfile[] = [
   },
 ];
 
+// ── LLM 模型成员（渠道下的子实体）────────────────────────────────────────────
+// demo：渠道 1 只有一个(历史迁移出的)默认成员；渠道 2 额外演示批量添加后的第二个
+// 非默认成员，用于验证模型行紧凑布局与默认单选。
+export const llmModelsByProfile: Record<string, LLMModelsResponse> = {
+  "1": {
+    profile_id: "1",
+    default_model_id: "11",
+    models: [
+      {
+        id: "11",
+        profile_id: "1",
+        upstream_model_id: "claude-opus-4-8",
+        display_name: "Claude Opus 4.8",
+        enabled: true,
+        is_default: true,
+      },
+    ],
+  },
+  "2": {
+    profile_id: "2",
+    default_model_id: "21",
+    models: [
+      {
+        id: "21",
+        profile_id: "2",
+        upstream_model_id: "deepseek-v4-flash",
+        display_name: "DeepSeek V4",
+        enabled: true,
+        is_default: true,
+      },
+      {
+        id: "22",
+        profile_id: "2",
+        upstream_model_id: "deepseek-r1",
+        display_name: "deepseek-r1",
+        enabled: true,
+        is_default: false,
+      },
+    ],
+  },
+};
+
+// ── 代理中心 ────────────────────────────────────────────────────────────────
+// demo：一条未注册的轻量 WARP，用于验证"注册前必须先确认条款"的交互；
+// 不预置任何 URL/密码，避免示例数据里出现像凭据的东西。
+export const proxies: ProxyRecord[] = [
+  {
+    id: 1,
+    name: "本机 WARP 出口",
+    kind: "warp",
+    enabled: true,
+    status: "stopped",
+  },
+];
+
 export const llmConfig = {
   configured: true,
   provider: "anthropic",
@@ -3358,6 +3446,10 @@ export const llmPool: LLMPoolStatus = {
       fails: 0,
       trips: 0,
       cooldown_secs: 0,
+      model_mode: "channel-default",
+      model_id: "11",
+      upstream_model_id: "claude-opus-4-8",
+      member_key: "1:11",
     },
     {
       profile_id: "2",
@@ -3373,6 +3465,10 @@ export const llmPool: LLMPoolStatus = {
       cooldown_secs: 42,
       last_error: "openai: status 402: insufficient balance",
       last_at: T("2026-07-26T00:10:00Z"),
+      model_mode: "channel-default",
+      model_id: "21",
+      upstream_model_id: "deepseek-v4-flash",
+      member_key: "2:21",
     },
   ],
 };

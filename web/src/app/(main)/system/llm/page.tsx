@@ -6,7 +6,6 @@ import {
   Loader2Icon,
   PlugZapIcon,
   PlusIcon,
-  RefreshCwIcon,
   RotateCcwIcon,
   SaveIcon,
   StarIcon,
@@ -20,16 +19,18 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import { modelOptionLabel } from "@/lib/llm-selection";
+import { type ModelRow, resolveApiKeyToSend, rowsFromResponse, saveChannelWithModels } from "@/lib/llm-models";
+import type { LLMModel, LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+import { ModelsEditor } from "./_components/models";
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
 
 // 思考开关(thinking.type)与思考强度(reasoning_effort)是两个【互相独立】的字段，
@@ -103,6 +104,63 @@ function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
 // 轮询配置抽屉
 // ─────────────────────────────────────────────────────────────────────────────
 
+// 该渠道贡献给全局轮询池的模型选择：跟随渠道当前默认，或固定某个模型成员
+// （渠道切换默认不影响它）。选项列表懒加载该渠道的模型成员，紧凑单行展示。
+function PoolRouteRow({ member, onChanged }: { member: LLMPoolMember; onChanged: () => void }) {
+  const [models, setModels] = React.useState<LLMModel[] | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  const value = member.model_mode === "fixed-model" && member.model_id ? member.model_id : "channel-default";
+
+  React.useEffect(() => {
+    let alive = true;
+    api
+      .llmModels(Number(member.profile_id))
+      .then((r) => {
+        if (alive) setModels(r.models);
+      })
+      .catch(() => {
+        /* 拉取失败时只保留"跟随渠道默认"选项；关闭重开本抽屉可重试 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [member.profile_id]);
+
+  async function change(next: string) {
+    if (saving || next === value) return;
+    setSaving(true);
+    try {
+      if (next === "channel-default") await api.setLLMPoolRoute(Number(member.profile_id), "channel-default", null);
+      else await api.setLLMPoolRoute(Number(member.profile_id), "fixed-model", next);
+      onChanged();
+    } catch (e) {
+      toast.error(`更新 ${member.name} 的轮询模型选择失败：${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-2 pl-7 text-xs">
+      <span className="text-muted-foreground">轮询模型</span>
+      <Select value={value} onValueChange={(v) => void change(v)} disabled={saving}>
+        <SelectTrigger size="sm" className="h-7 w-52">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="channel-default">跟随渠道默认</SelectItem>
+          {(models ?? []).map((m) => (
+            <SelectItem key={m.id} value={m.id} disabled={!m.enabled}>
+              {/* 展示名为主（产品要求的映射名），上游 ID 补充以防两个成员同名。 */}
+              {modelOptionLabel(m)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 function PoolSheet({
   open,
   onOpenChange,
@@ -141,11 +199,13 @@ function PoolSheet({
     }
   }
 
-  async function recover(id?: string) {
+  async function recover(memberKey?: string) {
     try {
-      await api.resetLLMPool(id);
+      // 单成员用 member_key 精确恢复（阶段 2 契约）；不带参 = 恢复全部。
+      if (memberKey) await api.resetLLMPoolMember(memberKey);
+      else await api.resetLLMPool();
       await onReload();
-      toast.success(id ? "已恢复该配置" : "已恢复全部配置");
+      toast.success(memberKey ? "已恢复该成员" : "已恢复全部成员");
     } catch (e) {
       toast.error(`恢复失败：${(e as Error).message}`);
     }
@@ -223,7 +283,7 @@ function PoolSheet({
                   const order = excluded ? null : inChain.findIndex((x) => x.profile_id === m.profile_id) + 1;
                   return (
                     <div
-                      key={m.profile_id}
+                      key={m.member_key ?? m.profile_id}
                       className={cn(
                         "grid gap-1 rounded-lg border p-2.5 text-sm",
                         excluded && "opacity-55",
@@ -254,8 +314,8 @@ function PoolSheet({
                               variant="ghost"
                               className="size-7"
                               aria-label="立即恢复"
-                              title="立即恢复：清除熔断，下次调用重试该配置"
-                              onClick={() => void recover(m.profile_id)}
+                              title="立即恢复：清除该成员的熔断，下次调用重试它"
+                              onClick={() => void recover(m.member_key ?? `${m.profile_id}:${m.model_id ?? ""}`)}
                             >
                               <RotateCcwIcon className="size-3.5" />
                             </Button>
@@ -271,6 +331,7 @@ function PoolSheet({
                           {m.last_error}
                         </p>
                       )}
+                      <PoolRouteRow member={m} onChanged={() => void onReload()} />
                     </div>
                   );
                 })}
@@ -312,10 +373,15 @@ function ProfileSheet({
   const isNew = !profile;
   const [name, setName] = React.useState("");
   const [format, setFormat] = React.useState<"anthropic" | "openai" | "openai-responses">("anthropic");
-  const [model, setModel] = React.useState("");
+  const [modelRows, setModelRows] = React.useState<ModelRow[]>([]);
+  const [defaultKey, setDefaultKey] = React.useState("");
+  // 新建渠道时，POST 成功但紧随其后的 PUT /models 失败会记下这个 id，
+  // 让重试走"更新已有渠道"分支，不会重复新建渠道。
+  const [createdProfileId, setCreatedProfileId] = React.useState<number | null>(null);
   const [baseUrl, setBaseUrl] = React.useState("");
   const [proxy, setProxy] = React.useState("");
   const [apiKey, setApiKey] = React.useState("");
+  const [replaceApiKey, setReplaceApiKey] = React.useState(false);
   const [keyHint, setKeyHint] = React.useState("");
   const [rps, setRps] = React.useState("0");
   const [rpm, setRpm] = React.useState("0");
@@ -331,9 +397,6 @@ function ProfileSheet({
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
-  const [models, setModels] = React.useState<string[]>([]);
-  const [loadingModels, setLoadingModels] = React.useState(false);
-  const [modelsOpen, setModelsOpen] = React.useState(false);
 
   // 每次打开时从传入的 profile 灌一遍表单（新建则重置为默认值）。抽屉关掉再打开
   // 就是一次干净的开始，不会留下上一个配置的残影。
@@ -341,7 +404,6 @@ function ProfileSheet({
     if (!open) return;
     setName(profile?.name ?? "");
     setFormat(profile?.format === "openai" || profile?.format === "openai-responses" ? profile.format : "anthropic");
-    setModel(profile?.model ?? "");
     setBaseUrl(profile?.base_url ?? "");
     setProxy(profile?.proxy ?? "");
     setRps(String(profile?.rate_per_second ?? 0));
@@ -357,44 +419,63 @@ function ProfileSheet({
     setSessionHeaderKey(profile?.session_header_key ?? "");
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
+    setReplaceApiKey(false);
     setKeyHint(profile?.api_key_hint ?? "");
-    setModels([]);
-    setModelsOpen(false);
+    setCreatedProfileId(null);
+    setModelRows([]);
+    setDefaultKey("");
+    if (profile) {
+      const pid = Number(profile.id);
+      void (async () => {
+        try {
+          const r = await api.llmModels(pid);
+          const { rows, defaultKey: dk } = rowsFromResponse(r.models);
+          setModelRows(rows);
+          setDefaultKey(dk);
+        } catch (e) {
+          toast.error(`读取模型列表失败：${(e as Error).message}`);
+        }
+      })();
+    }
   }, [open, profile]);
 
-  const profileId = profile ? Number(profile.id) : undefined;
+  // 新建渠道里，若第一步 POST 已成功但随后 PUT /models 失败，createdProfileId 会记下
+  // 这个 id，后续重试走"更新已有渠道"分支，不会重复新建渠道。
+  const profileId = profile ? Number(profile.id) : (createdProfileId ?? undefined);
+  // 编辑时只有明确选择更换，才允许把输入值用于保存、测试和拉取模型。
+  const requestApiKey = resolveApiKeyToSend(isNew, replaceApiKey, apiKey);
 
-  async function loadModels() {
-    if (loadingModels) return;
-    setLoadingModels(true);
-    setModels([]);
+  async function fetchModels(): Promise<string[]> {
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      const r = await api.fetchLLMModels(format, baseUrl, requestApiKey, proxy, profileId);
       if (r.ok && r.models && r.models.length > 0) {
-        setModels(r.models);
-        setModelsOpen(true);
         toast.success(`已加载 ${r.models.length} 个模型`);
-      } else {
-        toast.error(`加载模型失败：${r.error ?? "未获取到模型"}`);
+        return r.models;
       }
+      toast.error(`加载模型失败：${r.error ?? "未获取到模型"}`);
+      return [];
     } catch (e) {
       toast.error(`加载模型出错：${(e as Error).message}`);
-    } finally {
-      setLoadingModels(false);
+      return [];
     }
   }
 
   async function testConnection() {
     if (testing) return;
+    const defaultRow = modelRows.find((r) => r.key === defaultKey) ?? modelRows[0];
+    if (!defaultRow) {
+      toast.error("请先添加至少一个模型");
+      return;
+    }
     setTesting(true);
     try {
       // 用配置实际会跑的思考参数来测，这样不支持该字段的模型在这里就失败，
       // 而不是等到跑任务时才炸。传 profile id：Key 输入框留空时用已存的 Key。
       const r = await api.testLLM(
         format,
-        model,
+        defaultRow.upstreamId,
         baseUrl,
-        apiKey,
+        requestApiKey,
         proxy,
         toStore(thinkingType),
         toStore(effort),
@@ -404,7 +485,7 @@ function ProfileSheet({
       );
       // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
       if (r.ok)
-        toast.success(`连接成功 · ${r.latency_ms ?? "?"}ms · ${r.model ?? model}`, {
+        toast.success(`连接成功 · ${r.latency_ms ?? "?"}ms · ${r.model ?? defaultRow.upstreamId}`, {
           description: r.reply ? `回复：${r.reply}` : undefined,
         });
       else toast.error(`连接失败：${r.error ?? "未知"}`);
@@ -416,39 +497,53 @@ function ProfileSheet({
   }
 
   async function save() {
-    if (!name.trim() || !model.trim()) {
-      toast.error("请填写名称与模型");
+    if (!name.trim()) {
+      toast.error("请填写名称");
+      return;
+    }
+    if (modelRows.length === 0) {
+      toast.error("请至少添加一个模型（拉取模型后勾选添加）");
       return;
     }
     if (saving) return;
     setSaving(true);
     try {
-      const { id } = await api.saveLLMProfile({
-        ...(profile ? { id: Number(profile.id) } : {}),
-        name: name.trim(),
-        format,
-        model: model.trim(),
-        base_url: baseUrl.trim(),
-        proxy: proxy.trim(),
-        api_key: apiKey,
-        rate_per_second: Number(rps) || 0,
-        rate_per_minute: Number(rpm) || 0,
-        context_window_k: Number(cw) || 0,
-        thinking_type: toStore(thinkingType),
-        reasoning_effort: toStore(effort),
-        priority: Number(priority) || 0,
-        pool_exclude: poolExclude,
-        streaming,
-        max_tokens: Math.max(0, Number(maxTokens) || 0),
-        // 字段名开关只对 openai(Chat Completions) 有意义，其它格式一律回落到默认；
-        // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
-        max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
-        session_header_key: sessionHeaderKey.trim(),
-        retry,
-      });
+      const result = await saveChannelWithModels(
+        { saveProfile: api.saveLLMProfile, saveModels: api.saveLLMModels },
+        profileId,
+        {
+          name: name.trim(),
+          format,
+          base_url: baseUrl.trim(),
+          proxy: proxy.trim(),
+          api_key: requestApiKey,
+          rate_per_second: Number(rps) || 0,
+          rate_per_minute: Number(rpm) || 0,
+          context_window_k: Number(cw) || 0,
+          thinking_type: toStore(thinkingType),
+          reasoning_effort: toStore(effort),
+          priority: Number(priority) || 0,
+          pool_exclude: poolExclude,
+          streaming,
+          max_tokens: Math.max(0, Number(maxTokens) || 0),
+          // 字段名开关只对 openai(Chat Completions) 有意义，其它格式一律回落到默认；
+          // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
+          max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
+          session_header_key: sessionHeaderKey.trim(),
+          retry,
+        },
+        modelRows,
+        defaultKey,
+      );
+      if (!profileId) setCreatedProfileId(result.profileId);
+      if (!result.ok) {
+        toast.error(`渠道设置已保存，但模型列表未保存成功：${result.modelsError}，请重试保存`);
+        return; // 抽屉留开：保留草稿与 createdProfileId，重试会走更新分支，不会重复新建渠道
+      }
+
       if (isNew) toast.success(`已新建：${name.trim()}（在卡片上「设为激活」以启用）`);
       else toast.success(profile?.is_default ? "已保存，激活配置即时生效，无需重启" : "已保存");
-      onSaved(String(id));
+      onSaved(String(result.profileId));
       onOpenChange(false);
     } catch (e) {
       toast.error(`保存失败：${(e as Error).message}`);
@@ -505,52 +600,14 @@ function ProfileSheet({
             </div>
           </div>
 
-          <div className="grid gap-2">
-            <Label htmlFor="p-model">模型</Label>
-            <div className="flex gap-2">
-              <Input
-                id="p-model"
-                className="font-mono"
-                placeholder="claude-opus-4-8"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-              />
-              {/* modal: 这个 Popover 的内容被 portal 到 <body>，在 Sheet 的滚动锁之外，
-                  不加 modal 时列表能渲染却滚不动。modal 让它自己持有最上层滚动锁。 */}
-              <Popover open={modelsOpen} onOpenChange={setModelsOpen} modal>
-                <PopoverTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    className="shrink-0"
-                    disabled={loadingModels}
-                    onClick={loadModels}
-                    title="从 API 加载可用模型"
-                  >
-                    {loadingModels ? <Loader2Icon className="animate-spin" /> : <RefreshCwIcon />}
-                  </Button>
-                </PopoverTrigger>
-                {models.length > 0 && (
-                  <PopoverContent className="max-h-72 w-72 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
-                    {models.map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
-                        onClick={() => {
-                          setModel(m);
-                          setModelsOpen(false);
-                        }}
-                      >
-                        {m}
-                      </button>
-                    ))}
-                  </PopoverContent>
-                )}
-              </Popover>
-            </div>
-          </div>
+          <ModelsEditor
+            rows={modelRows}
+            defaultKey={defaultKey}
+            onRowsChange={setModelRows}
+            onDefaultChange={setDefaultKey}
+            onFetch={fetchModels}
+            disabled={saving}
+          />
 
           <div className="grid gap-2">
             <Label htmlFor="p-base-url">Base URL（可选）</Label>
@@ -573,8 +630,11 @@ function ProfileSheet({
               onChange={(e) => setProxy(e.target.value)}
             />
             <p className="text-muted-foreground text-xs">
-              仅 LLM 出站请求走此代理，支持 http/https/socks5，可带账号密码（如
-              socks5://user:pass@host:port，密码含特殊字符需 URL 编码）；留空表示不使用代理（直连）。
+              仅本渠道的 LLM 出站请求走此代理，支持 http/https/socks5，可带账号密码（如
+              socks5://user:pass@host:port，密码含特殊字符需 URL 编码）。
+            </p>
+            <p className="text-muted-foreground text-xs">
+              留空时不在此处直连：任务若选了「指定代理」或「明确直连」则以任务为准；任务用「继承」时走任务创建时保存的出口快照，快照为直连才直连。对话等其它入口不经过任务快照。
             </p>
           </div>
 
@@ -595,14 +655,60 @@ function ProfileSheet({
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="p-api-key">API Key</Label>
-            <Input
-              id="p-api-key"
-              type="password"
-              placeholder={keyHint ? `已设置（${keyHint}），留空保持不变` : "sk-…"}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-            />
+            {isNew || replaceApiKey ? (
+              <>
+                <Label htmlFor="p-api-key">{isNew ? "API Key" : "新的 API Key"}</Label>
+                <Input
+                  id="p-api-key"
+                  name="llm-api-key"
+                  type="password"
+                  autoComplete="new-password"
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  data-form-type="other"
+                  spellCheck={false}
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  placeholder={isNew ? "sk-…" : "输入新的 API Key，留空保持原 Key"}
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                />
+                {!isNew && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setApiKey("");
+                      setReplaceApiKey(false);
+                    }}
+                  >
+                    取消更换
+                  </Button>
+                )}
+              </>
+            ) : (
+              <>
+                <Label>API Key</Label>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground text-sm">
+                    {keyHint ? `已保存（${keyHint}）` : "保留现有 Key"}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setApiKey("");
+                      setReplaceApiKey(true);
+                    }}
+                  >
+                    更换 API Key
+                  </Button>
+                </div>
+                <p className="text-muted-foreground text-xs">保存其他设置、测试连接和获取模型时使用已保存的 Key。</p>
+              </>
+            )}
           </div>
 
           <div className="grid gap-4 sm:grid-cols-3">

@@ -5,11 +5,20 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
+import {
+  ArchiveIcon,
+  ArrowLeftIcon,
+  BrainIcon,
+  CheckIcon,
+  CircleAlertIcon,
+  PauseIcon,
+  PlayIcon,
+  RadioTowerIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
+import { ChannelModelChain } from "@/components/llm-selection";
 import { StatusBadge } from "@/components/status-badge";
-import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -37,7 +46,19 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
-import type { LLMProfile, Task } from "@/lib/types";
+import {
+  chainValidationError,
+  emptyModelCache,
+  formatMember,
+  initialActivePosition,
+  needModels,
+  resolveActivePosition,
+  selectionsFromTask,
+  selectionsFromTaskWithReport,
+  validationErrorFromDropped,
+} from "@/lib/llm-selection";
+import { proxyEndpoint, taskProxyLabel } from "@/lib/proxy-center";
+import type { LLMModel, LLMProfile, LLMSelection, Task } from "@/lib/types";
 
 import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
@@ -63,40 +84,50 @@ const TABS = [
   { value: "report", label: "报告" },
 ];
 
-function taskProfileIDs(task: Task): string[] {
-  if (task.llm_profile_ids && task.llm_profile_ids.length > 0) {
-    return task.llm_profile_ids.map(String);
-  }
-  return task.llm_profile_id ? [String(task.llm_profile_id)] : [];
-}
-
+// TaskLLMControl 编辑任务的渠道+模型候选链：
+//   - 配置态 members 从 DTO 的 members 读（存在即权威，空数组=继承）；
+//   - 实际生效项来自 DTO 的 active_member，链耗尽时为 null，绝不拿第一项充数；
+//   - 保存走 PUT /tasks/{id}/llm，members 始终显式发送（空数组=恢复继承）。
 function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: LLMProfile[]; onUpdated: () => void }) {
   const [open, setOpen] = React.useState(false);
-  const [profileIDs, setProfileIDs] = React.useState<string[]>(() => taskProfileIDs(task));
-  const [activeProfileID, setActiveProfileID] = React.useState(
-    task.active_llm_profile_id ? String(task.active_llm_profile_id) : (taskProfileIDs(task)[0] ?? ""),
+  const [members, setMembers] = React.useState<LLMSelection[]>(() => selectionsFromTask(task));
+  // 编辑草稿的"生效候选"位置：仅决定保存后从第几项开始尝试，不代表当前实际生效。
+  const [activePosition, setActivePosition] = React.useState<number | null>(() =>
+    initialActivePosition(task.active_position ?? null, selectionsFromTask(task).length),
   );
+  const [modelsByProfile, setModelsByProfile] = React.useState<Record<string, LLMModel[] | undefined>>({});
+  const [loadingProfiles, setLoadingProfiles] = React.useState<Record<string, boolean>>({});
+  const modelCacheRef = React.useRef(emptyModelCache());
   const [saving, setSaving] = React.useState(false);
   const popoverContentRef = React.useRef<HTMLDivElement>(null);
 
-  const chain = taskProfileIDs(task);
+  const chainMembers = selectionsFromTask(task);
+  // DTO 里若有坏行（未知模式、缺成员等），读取时就被丢掉——这里必须记住这件事并阻止
+  // 保存：净化后的链可能正好变空，而"空链"表示继承，坏数据会被当成正常继承写回去。
+  const dtoDropped = React.useMemo(() => selectionsFromTaskWithReport(task).dropped, [task]);
   const exhausted = task.llm_failover_state === "chain_exhausted";
   // 任何状态都可以改链,终态也不例外:任务结束后主 Agent 对话仍走这条链,
   // 链上模型出问题时必须能换掉,否则已完成任务就没法继续交互。
   const terminal = ["done", "failed", "timeout"].includes(task.status);
-  // A null active profile on an exhausted, non-empty chain is a persisted end
-  // cursor. Keep the status display honest; choosing the first profile is only
-  // the editor's reset draft and does not mean it is currently active.
-  let activeID = chain[0] ?? "";
-  if (exhausted) activeID = "";
-  if (task.active_llm_profile_id) activeID = String(task.active_llm_profile_id);
-  const activeProfile = profiles.find((profile) => profile.id === activeID);
-  const currentLabel = exhausted
-    ? "配置链已耗尽"
-    : (activeProfile?.name ?? (activeID ? `配置 #${activeID}` : "跟随默认配置"));
-  const activeIndex = chain.indexOf(activeID);
-  const backupCount = activeIndex >= 0 ? Math.max(0, chain.length - activeIndex - 1) : 0;
-  const currentTitle = [currentLabel, activeProfile?.model, backupCount > 0 ? `${backupCount} 个备用` : ""]
+  // 实际生效项只认后端解析结果（active_member）：配置态是 channel-default 时它也带
+  // 真实 model_id，成员键才是身份。没有它就说"无生效项"，不拿第一项充数。
+  const liveMember = task.active_member ?? undefined;
+  const currentLabel = liveMember
+    ? liveMember.display_name || liveMember.upstream_model_id
+    : exhausted
+      ? "配置链已耗尽"
+      : chainMembers.length === 0
+        ? "跟随默认配置"
+        : "无生效成员";
+  const backupCount = Math.max(
+    0,
+    chainMembers.length - (resolveActivePosition(task.active_position ?? null, chainMembers.length) ?? 0) - 1,
+  );
+  const currentTitle = [
+    currentLabel,
+    liveMember ? formatMember(liveMember) : "",
+    backupCount > 0 ? `${backupCount} 个备用` : "",
+  ]
     .filter(Boolean)
     .join(" · ");
   let editorDescription = "调整顺序或当前配置后，将从下一次 LLM 调用开始生效。";
@@ -105,10 +136,25 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
   if (exhausted) saveLabel = "保存并重置";
   if (saving) saveLabel = "保存中";
 
+  const loadProfileModels = React.useCallback(async (profileID: string) => {
+    setLoadingProfiles((prev) => ({ ...prev, [profileID]: true }));
+    try {
+      const models = await needModels(modelCacheRef.current, profileID, async (id) => {
+        const r = await api.llmModels(Number(id));
+        return r.models;
+      });
+      setModelsByProfile((prev) => ({ ...prev, [profileID]: models }));
+    } catch (e) {
+      toast.error(`读取渠道 #${profileID} 的模型列表失败：${(e as Error).message}`);
+    } finally {
+      setLoadingProfiles((prev) => ({ ...prev, [profileID]: false }));
+    }
+  }, []);
+
   const syncDraft = React.useCallback(() => {
-    const next = taskProfileIDs(task);
-    setProfileIDs(next);
-    setActiveProfileID(task.active_llm_profile_id ? String(task.active_llm_profile_id) : (next[0] ?? ""));
+    const next = selectionsFromTask(task);
+    setMembers(next);
+    setActivePosition(initialActivePosition(task.active_position ?? null, next.length));
   }, [task]);
 
   const handleOpenChange = (next: boolean) => {
@@ -116,18 +162,22 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
     if (next) syncDraft();
   };
 
-  const handleProfileIDsChange = (next: string[]) => {
-    setProfileIDs(next);
-    setActiveProfileID((current) => (next.includes(current) ? current : (next[0] ?? "")));
-  };
+  const chainError = chainValidationError(members);
+  // DTO 坏行与客户端草稿校验合并成同一条阻止保存的理由。
+  const saveBlockedReason = chainError || validationErrorFromDropped(dtoDropped);
 
   const save = async () => {
+    if (saveBlockedReason) {
+      toast.error(saveBlockedReason);
+      return;
+    }
     setSaving(true);
     try {
-      const result = await api.updateTaskLLMProfiles(
+      const result = await api.updateTaskLLMMembers(
         task.id,
-        profileIDs.map(Number),
-        activeProfileID ? Number(activeProfileID) : undefined,
+        members,
+        // members 为空(继承)时不下发位置；否则发草稿位置（null 时也省略，后端选第一项）。
+        members.length > 0 && activePosition !== null ? activePosition : undefined,
       );
       if (result.switch_event) {
         toast.info(result.switch_event.summary, { id: `task-${task.id}-llm-${result.switch_event.seq}` });
@@ -177,22 +227,35 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
           </Alert>
         )}
 
-        <TaskLLMProfileChain
+        <ChannelModelChain
           profiles={profiles}
-          value={profileIDs}
-          onValueChange={handleProfileIDsChange}
-          activeProfileId={activeProfileID}
-          onActiveProfileChange={setActiveProfileID}
-          inputId="task-llm-profiles"
+          members={members}
+          activePosition={activePosition}
+          activeMember={liveMember}
+          onMembersChange={setMembers}
+          onActivePositionChange={setActivePosition}
+          modelsByProfile={modelsByProfile}
+          onNeedModels={(id) => void loadProfileModels(id)}
+          loadingProfiles={loadingProfiles}
           disabled={saving}
-          portalContainer={popoverContentRef}
+          inputId="task-llm-profiles"
         />
+        {chainError && (
+          <p role="alert" className="text-destructive text-xs">
+            {chainError}
+          </p>
+        )}
+        {!chainError && dtoDropped.length > 0 && (
+          <p role="alert" className="text-destructive text-xs">
+            {validationErrorFromDropped(dtoDropped)}
+          </p>
+        )}
 
         <div className="flex justify-end gap-2">
           <Button type="button" variant="outline" size="sm" onClick={() => setOpen(false)}>
             关闭
           </Button>
-          <Button type="button" size="sm" onClick={save} disabled={saving}>
+          <Button type="button" size="sm" onClick={save} disabled={saving || !!saveBlockedReason}>
             {saving && <Spinner data-icon="inline-start" />}
             {saveLabel}
           </Button>
@@ -366,6 +429,41 @@ function TaskDetailInner() {
           </code>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
           <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button size="sm" variant="outline" title="任务代理快照" aria-label="查看任务代理快照">
+                <RadioTowerIcon data-icon="inline-start" />
+                <span className="hidden lg:inline">{taskProxyLabel(task)}</span>
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-[min(24rem,calc(100vw-2rem))] gap-3 p-4">
+              <PopoverHeader>
+                <PopoverTitle>任务代理快照</PopoverTitle>
+                <PopoverDescription>创建时保存的出口，同时用于任务工具和任务 LLM 请求。</PopoverDescription>
+              </PopoverHeader>
+              <p className="text-sm">
+                选择方式：
+                {task.proxy_mode
+                  ? { inherit: "继承全局默认", direct: "明确直连", fixed: "指定编号" }[task.proxy_mode]
+                  : "旧任务未记录"}
+              </p>
+              {task.proxy ? (
+                <div className="space-y-2 text-sm">
+                  <p>
+                    编号：#{task.proxy.id} · {task.proxy.name}
+                  </p>
+                  <p>类型：{task.proxy.kind}</p>
+                  <p className="break-all font-mono text-xs">出口：{proxyEndpoint(task.proxy)}</p>
+                  {task.proxy.resin_platform && <p>Platform：{task.proxy.resin_platform}</p>}
+                </div>
+              ) : (
+                <p className="text-sm">{taskProxyLabel(task)}</p>
+              )}
+              <p className="text-muted-foreground text-xs">
+                全局默认或代理记录后续变更不会改写此快照；当前健康状态请到代理中心检测。
+              </p>
+            </PopoverContent>
+          </Popover>
           <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
           {canArchive ? (
             <AlertDialog>

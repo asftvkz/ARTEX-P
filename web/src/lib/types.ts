@@ -3,6 +3,50 @@
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
+export type ProxyKind = "http" | "https" | "socks5" | "warp" | "resin";
+export type TaskProxyMode = "inherit" | "direct" | "fixed";
+
+export interface ProxyRecord {
+  id: number;
+  name: string;
+  kind: ProxyKind;
+  protocol?: "http" | "socks5" | string;
+  url?: string;
+  host?: string;
+  port?: number;
+  username?: string;
+  resin_platform?: string;
+  resin_admin_url?: string;
+  has_password?: boolean;
+  has_resin_admin_token?: boolean;
+  enabled: boolean;
+  status: "unknown" | "healthy" | "failed" | "starting" | "stopped" | string;
+  last_error?: string;
+  last_checked_at?: string;
+}
+
+export type ProxyWriteInput = {
+  name: string;
+  kind: ProxyKind;
+  protocol?: string;
+  url?: string;
+  host?: string;
+  port?: number;
+  username?: string;
+  password?: string;
+  resin_platform?: string;
+  resin_admin_url?: string;
+  resin_admin_token?: string;
+  enabled?: boolean;
+  clear_password?: boolean;
+  clear_resin_admin_token?: boolean;
+};
+
+// 任务保存的是出口快照，不代表代理中心当前健康状态。
+export type TaskProxySnapshot = Pick<
+  ProxyRecord,
+  "id" | "name" | "kind" | "protocol" | "url" | "host" | "port" | "username" | "resin_platform"
+>;
 
 export interface Task {
   id: string;
@@ -35,10 +79,18 @@ export interface Task {
   active_llm_profile_id?: number; // profile used by the next LLM call
   llm_failover_state?: "default" | "ready" | "chain_exhausted" | string;
   llm_failover_reason?: string;
+  // 阶段 2：显式渠道+模型候选链（配置态）与当前实际解析的成员。旧的
+  // llm_profile_id(s)/active_llm_profile_id 继续保留，语义不变。
+  members?: LLMSelection[];
+  active_position?: number | null; // 当前候选下标（零起始）；null=未定位
+  active_member?: LLMActiveMember | null; // 实际解析结果；无可用成员时为 null
   source_task_ids?: string[]; // directly related tasks inherited as read-only context
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  proxy_mode?: TaskProxyMode;
+  proxy_id?: number;
+  proxy?: TaskProxySnapshot;
 }
 
 export interface TaskCategory {
@@ -683,6 +735,12 @@ export interface TaskLLMResolution {
   source: "task_chain" | "agent_binding" | "global_profile" | "environment" | "global";
   available: boolean;
   reason?: string;
+  // 阶段 2：实际解析到的成员身份（字符串 ID）。旧字段保留。
+  model_mode?: LLMModelMode;
+  model_id?: string;
+  upstream_model_id?: string;
+  display_name?: string;
+  member_key?: string;
 }
 
 export interface TaskLLMResolutions {
@@ -741,6 +799,10 @@ export interface Conversation {
   agent_key: string;
   title: string;
   llm_profile_id?: number;
+  // 阶段 2：配置态的渠道+模型选择。缺省/null 表示未覆盖，继承 Agent 绑定再回退全局。
+  profile_id?: string | null;
+  model_mode?: LLMModelMode | null;
+  model_id?: string | null;
   pinned?: boolean;
   pinned_at?: string | null;
   created_at: string;
@@ -1058,6 +1120,26 @@ export interface LLMProfile {
   retry?: LLMRetryOverride;
 }
 
+// ---- LLM 模型成员（渠道下的子实体）----
+// 一个渠道(LLMProfile)下可配置多个模型成员。upstream_model_id 是实际发给上游的 ID，
+// 跨渠道即使相同也不代表同一模型;display_name 仅供界面显示/人工识别,不参与路由或
+// 等价判断。两者 ID 全部按字符串传递,避免 JS 整数精度问题。
+export interface LLMModel {
+  id: string;
+  profile_id: string;
+  upstream_model_id: string;
+  display_name: string;
+  enabled: boolean;
+  // is_default 是该渠道 default_model_id 的派生字段,方便 UI 渲染。
+  is_default: boolean;
+}
+
+export interface LLMModelsResponse {
+  profile_id: string;
+  default_model_id: string | null;
+  models: LLMModel[];
+}
+
 // ---- LLM 重试策略 ----
 // 一层重试的两个旋钮。两者都是「0 = 未配置」：
 //   attempts    0=用默认次数 | -1=关闭该层重试 | >0=重试次数
@@ -1087,6 +1169,27 @@ export interface LLMRetryPolicy extends LLMRetryOverride {
 //   ok       正常
 //   degraded 有连续失败但未达熔断阈值
 //   tripped  已熔断，冷却期内被跳过（cooldown_secs 为剩余秒数）
+export type LLMModelMode = "channel-default" | "fixed-model";
+
+// 渠道 + 模型的选择三元组（配置态）。历史只传 llm_profile_id 的请求按
+// channel-default 解释；model_id 仅在 fixed-model 时非空。ID 一律字符串。
+export interface LLMSelection {
+  profile_id: string;
+  model_mode: LLMModelMode;
+  model_id: string | null;
+}
+
+// 运行解析出的实际成员身份。注意与配置态的区别：即便配置是 channel-default，
+// active_member.model_id 也是当前实际解析到的成员 ID，不是 null。
+export interface LLMActiveMember {
+  profile_id: string;
+  model_mode: LLMModelMode;
+  model_id: string | null;
+  upstream_model_id: string;
+  display_name: string;
+  member_key: string; // "{profile_id}:{model_id}"
+}
+
 export interface LLMPoolMember {
   profile_id: string;
   name: string;
@@ -1101,6 +1204,15 @@ export interface LLMPoolMember {
   cooldown_secs: number;
   last_error?: string;
   last_at?: string;
+  // 该渠道在全局轮询池里的模型选择。历史响应缺省按 channel-default 解释。
+  model_mode: LLMModelMode;
+  // 实际解析出的成员 id；渠道暂无可用默认模型时为 null，该渠道不产生可调用池成员。
+  model_id: string | null;
+  // 与 model 当前同值，单独保留该字段避免前端把展示名称或未来的兼容字段误用于请求模型。
+  upstream_model_id: string;
+  // 成员身份键 "{profile_id}:{model_id}"。熔断/失败计数/冷却时间均以它为身份存储，
+  // 默认成员变化后会得到新的 member_key 与独立状态，不能再仅以 profile_id 复用状态。
+  member_key: string;
 }
 
 export interface LLMPoolStatus {
@@ -1119,6 +1231,10 @@ export interface Agent {
   builtin: boolean;
   enabled: boolean;
   llm_profile_id?: number | null; // 绑定的 LLM 配置；null/absent = 跟随任务/会话/全局
+  // 阶段 2：绑定渠道+模型（配置态字符串）。llm_profile_id 旧语义保留，新字段优先。
+  profile_id?: string | null;
+  model_mode?: LLMModelMode | null;
+  model_id?: string | null;
   max_turns?: number; // 0 = 无限制
   run_seconds?: number; // worker 单次运行墙钟上限(秒)；0 = 无限制
   web_search?: boolean; // 是否启用网络搜索(受系统全局开关门控)

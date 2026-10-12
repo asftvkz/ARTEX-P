@@ -22,10 +22,11 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
+import { ModelSelect } from "@/components/llm-selection";
 import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
-import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { Transcript } from "@/components/transcript";
 import {
   AlertDialog,
@@ -56,9 +57,10 @@ import { useSideQuestions } from "@/hooks/use-side-questions";
 import { mergeActivities } from "@/lib/activity-merge";
 import { api } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
+import { emptyModelCache, needModels, selectionModeLabel } from "@/lib/llm-selection";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { isBtwCommand } from "@/lib/side-questions";
-import type { Activity, Agent, ChatAttachment, Conversation, LLMProfile } from "@/lib/types";
+import type { Activity, Agent, ChatAttachment, Conversation, LLMModel, LLMProfile, LLMSelection } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // fmtBytes renders a human file size for attachment chips (mirrors transcript.tsx).
@@ -276,25 +278,55 @@ function Composer({
   );
 }
 
-// LLMProfileRow shows the active LLM config below the composer and lets the user
-// switch it via a Popover. `selected` is the profile id or null for default.
+// LLMProfileRow 在输入框下方显示并切换本对话的 LLM 覆盖。覆盖的完整身份是
+// 「渠道 + 模型选择」三元组：cleared = 清除覆盖（继承 Agent 绑定，再回退全局）；
+// channel-default 跟随渠道当前默认成员；fixed-model 固定某个成员，渠道换默认不受影响。
+// 展示名只用于识别，身份一律以 member id 为准（见 docs/llm-models-contract.md）。
 function LLMProfileRow({
   profiles,
-  selected,
+  selection,
   onChange,
   disabled,
   rightSlot,
 }: {
   profiles: LLMProfile[];
-  selected: number | null;
-  onChange: (id: number | null) => void;
+  selection: LLMSelection | null;
+  onChange: (next: LLMSelection | null) => void;
   disabled?: boolean;
   rightSlot?: React.ReactNode;
 }) {
   const [open, setOpen] = React.useState(false);
+  const [models, setModels] = React.useState<LLMModel[] | undefined>(undefined);
+  const [modelsLoading, setModelsLoading] = React.useState(false);
+  const cacheRef = React.useRef(emptyModelCache());
+  const selectedProfileID = selection?.profile_id ?? "";
   const activeDefault = profiles.find((p) => p.is_default);
-  const current = selected != null ? profiles.find((p) => Number(p.id) === selected) : null;
-  const label = current ? current.name : `默认${activeDefault ? `（${activeDefault.name}）` : ""}`;
+  const current = selectedProfileID ? profiles.find((p) => p.id === selectedProfileID) : null;
+  // 主文案用展示名（产品要求：它就是给人看的名字）。固定成员时从已拉到的成员列表里
+  // 查它的展示名，查不到才退回内部 ID——身份仍是 model_id，名字只负责好认。
+  const selectedMember =
+    selection?.model_mode === "fixed-model" && selection.model_id
+      ? models?.find((m) => m.id === selection.model_id)
+      : undefined;
+  const label = selection
+    ? `${current?.name ?? `渠道 #${selection.profile_id}`} · ${selectionModeLabel(selection, selectedMember)}`
+    : `默认${activeDefault ? `（${activeDefault.name}）` : ""}`;
+
+  const loadModels = React.useCallback(async (profileID: string) => {
+    setModelsLoading(true);
+    try {
+      setModels(await needModels(cacheRef.current, profileID, async (id) => (await api.llmModels(Number(id))).models));
+    } catch (e) {
+      toast.error(`读取渠道模型失败：${(e as Error).message}`);
+    } finally {
+      setModelsLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    setModels(undefined);
+    if (open && selectedProfileID) void loadModels(selectedProfileID);
+  }, [open, selectedProfileID, loadModels]);
 
   return (
     <div className="flex min-w-0 shrink-0 items-center gap-1 px-1 pt-0.5 pb-1">
@@ -313,9 +345,9 @@ function LLMProfileRow({
             <ChevronDownIcon className="size-3" />
           </button>
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-64 p-1">
+        <PopoverContent align="start" className="w-72 p-1">
           <p className="text-muted-foreground px-2 py-1 text-[11px] font-medium">选择 LLM 配置</p>
-          {/* default option */}
+          {/* 默认：清除本对话覆盖，继承 Agent 绑定再回退全局 */}
           <button
             type="button"
             onClick={() => {
@@ -324,35 +356,49 @@ function LLMProfileRow({
             }}
             className={cn(
               "flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-accent",
-              selected == null && "bg-accent",
+              selection == null && "bg-accent",
             )}
           >
             <span className="text-sm">默认{activeDefault ? `（${activeDefault.name}）` : ""}</span>
-            {activeDefault && (
-              <span className="text-muted-foreground text-[11px]">
-                {activeDefault.format} · {activeDefault.model}
-              </span>
-            )}
+            <span className="text-muted-foreground text-[11px]">
+              {activeDefault ? `${activeDefault.format} · ${activeDefault.model}` : "继承 Agent 绑定 / 全局"}
+            </span>
           </button>
-          {profiles.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              onClick={() => {
-                onChange(Number(p.id));
-                setOpen(false);
-              }}
-              className={cn(
-                "flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-accent",
-                selected === Number(p.id) && "bg-accent",
-              )}
-            >
-              <span className="text-sm">{p.name}</span>
-              <span className="text-muted-foreground text-[11px]">
-                {p.format} · {p.model}
-              </span>
-            </button>
-          ))}
+          {profiles.map((p) => {
+            const picked = selectedProfileID === p.id;
+            return (
+              <div key={p.id} className={cn("rounded", picked && "bg-accent")}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    // 选渠道本身 = 该渠道跟随默认模型；模型改在上面那行下拉里调。
+                    onChange({ profile_id: p.id, model_mode: "channel-default", model_id: null });
+                    void loadModels(p.id);
+                  }}
+                  className="flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-accent"
+                >
+                  <span className="text-sm">{p.name}</span>
+                  <span className="text-muted-foreground text-[11px]">
+                    {p.format} · {p.model}
+                  </span>
+                </button>
+                {picked && (
+                  <div className="flex items-center gap-2 px-2 pb-2">
+                    <span className="text-muted-foreground text-[11px]">模型</span>
+                    <ModelSelect
+                      value={selection ?? { profile_id: p.id, model_mode: "channel-default", model_id: null }}
+                      models={models}
+                      modelsLoading={modelsLoading}
+                      onNeedModels={() => void loadModels(p.id)}
+                      onChange={onChange}
+                      disabled={disabled}
+                      className="h-7 flex-1"
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </PopoverContent>
       </Popover>
       {rightSlot}
@@ -374,7 +420,8 @@ function DraftChat({
   onStarted: (c: Conversation, pending?: { input?: string; attachments?: ChatAttachment[] }) => void;
 }) {
   const [agentKey, setAgentKey] = React.useState("");
-  const [llmProfileId, setLlmProfileId] = React.useState<number | null>(null);
+  // 草稿对话还没落库，这里只是"创建时要带的覆盖"；null = 不覆盖（继承 Agent/全局）。
+  const [llmSelection, setLlmSelection] = React.useState<LLMSelection | null>(null);
   const [input, setInput] = React.useState("");
   const [sending, setSending] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
@@ -391,7 +438,7 @@ function DraftChat({
     if (!msg || !agentKey || sending) return;
     setSending(true);
     try {
-      const c = await api.createConversation(agentKey, "", llmProfileId);
+      const c = await api.createConversationWithSelection(agentKey, "", llmSelection);
       await api.sendConversationMessage(c.id, msg);
       onStarted(c);
     } catch (e) {
@@ -409,7 +456,7 @@ function DraftChat({
     if (files.length === 0 || !agentKey || uploading || sending) return;
     setUploading(true);
     try {
-      const c = await api.createConversation(agentKey, "", llmProfileId);
+      const c = await api.createConversationWithSelection(agentKey, "", llmSelection);
       const r = await api.chatUpload("session", `conv-${c.id}`, files);
       onStarted(c, { input, attachments: r.attachments });
     } catch (e) {
@@ -466,8 +513,8 @@ function DraftChat({
       />
       <LLMProfileRow
         profiles={profiles}
-        selected={llmProfileId}
-        onChange={setLlmProfileId}
+        selection={llmSelection}
+        onChange={setLlmSelection}
         disabled={sending || uploading}
       />
     </>
@@ -510,12 +557,31 @@ function ChatView({
   const [historyLoaded, setHistoryLoaded] = React.useState(false);
   const [hasMore, setHasMore] = React.useState(false); // drives the "load earlier" hint
   const agent = agents.find((a) => a.key === conv.agent_key);
+  // 覆盖的配置态：优先新三元组字段；两者都没有（老数据/老后端）时用旧的整数
+  // llm_profile_id 按"渠道默认模型"解释，行为与升级前一致。null = 未覆盖。
   const currentProfileId = conv.llm_profile_id ?? null;
+  const conversationSelection: LLMSelection | null = conv.profile_id
+    ? {
+        profile_id: String(conv.profile_id),
+        model_mode: conv.model_mode ?? "channel-default",
+        model_id: conv.model_id ?? null,
+      }
+    : currentProfileId !== null
+      ? { profile_id: String(currentProfileId), model_mode: "channel-default", model_id: null }
+      : null;
   const side = useSideQuestions(`/api/conversations/${conv.id}`);
 
-  async function changeProfile(id: number | null) {
+  // 更新一律走 PATCH /conversations/{id}/profile：null = 清除覆盖（继承 Agent 绑定，
+  // 再回退全局）；否则发完整三元组，避免只发模型字段时后端报"未绑定渠道"。
+  async function changeProfile(next: LLMSelection | null) {
     try {
-      await api.updateConversationProfile(conv.id, id);
+      if (next === null) await api.updateConversationSelection(conv.id, { profile_id: null });
+      else
+        await api.updateConversationSelection(conv.id, {
+          profile_id: next.profile_id,
+          model_mode: next.model_mode,
+          model_id: next.model_mode === "fixed-model" ? next.model_id : null,
+        });
       onConvUpdated();
     } catch (e) {
       toast.error("切换 LLM 失败：" + (e as Error).message);
@@ -607,14 +673,23 @@ function ChatView({
     };
   }, [running, conv.id, onTitleMaybeChanged]);
 
-  const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
+  const loadFocusPage = React.useCallback(
+    (before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE),
+    [conv.id],
+  );
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
     setMessages((prev) => mergeActivities(page.items, prev));
     earliestRef.current = page.items[0]?.seq ?? earliestRef.current;
     hasMoreRef.current = page.hasMore;
     setHasMore(page.hasMore);
   }, []);
-  const focusHistory = useApprovalHistory(approvalFocus.state?.source, historyLoaded, messages, loadFocusPage, mergeFocusPage);
+  const focusHistory = useApprovalHistory(
+    approvalFocus.state?.source,
+    historyLoaded,
+    messages,
+    loadFocusPage,
+    mergeFocusPage,
+  );
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -804,7 +879,13 @@ function ChatView({
               {hasMore && (
                 <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">向上滚动加载更早的消息…</div>
               )}
-              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} />
+              <Transcript
+                activity={messages}
+                live={running}
+                chat
+                fetchDetail={fetchDetail}
+                focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+              />
             </>
           )}
         </div>
@@ -827,7 +908,7 @@ function ChatView({
       />
       <LLMProfileRow
         profiles={profiles}
-        selected={currentProfileId}
+        selection={conversationSelection}
         onChange={changeProfile}
         disabled={running || sending}
         rightSlot={<TodoPopover seq={latestTodoSeq} fetchDetail={fetchDetail} />}
@@ -1050,15 +1131,18 @@ export default function ChatPage() {
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   const [sourceRequested, setSourceRequested] = React.useState(false);
   const [convsLoaded, setConvsLoaded] = React.useState(false);
-  const selectConversation = React.useCallback((id: number | null) => {
-    if (id !== selectedId) {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("approval");
-      setSourceRequested(false);
-      window.history.replaceState(null, "", url);
-    }
-    setSelectedId(id);
-  }, [selectedId]);
+  const selectConversation = React.useCallback(
+    (id: number | null) => {
+      if (id !== selectedId) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("approval");
+        setSourceRequested(false);
+        window.history.replaceState(null, "", url);
+      }
+      setSelectedId(id);
+    },
+    [selectedId],
+  );
 
   const [renamingId, setRenamingId] = React.useState<number | null>(null);
   const [renameText, setRenameText] = React.useState("");
@@ -1085,7 +1169,10 @@ export default function ChatPage() {
     const seq = ++conversationListSeq.current;
     try {
       const items = await api.conversations();
-      if (seq === conversationListSeq.current) { setConvs(items); setConvsLoaded(true); }
+      if (seq === conversationListSeq.current) {
+        setConvs(items);
+        setConvsLoaded(true);
+      }
     } catch {
       // Preserve the selected transcript and list on a transient poll failure.
     }

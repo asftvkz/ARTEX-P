@@ -21,6 +21,7 @@ import type {
   FindingTraffic,
   FindingTrafficBinding,
   IntentAsset,
+  LLMActiveMember,
   ScopeRow,
   Task,
   TaskArchive,
@@ -48,6 +49,15 @@ const mockLLMRecords = structuredClone(D.llmRecords);
 const mockTaskTemplates = structuredClone(D.taskTemplates);
 const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
+const mockLLMPool = structuredClone(D.llmPool);
+const mockLLMModels = structuredClone(D.llmModelsByProfile);
+const mockProxies = structuredClone(D.proxies);
+// Agent 的渠道+模型绑定覆盖（demo 内存态）：PUT /agents/{key}/config 落这里，
+// GET /agents/{key} 再合并回去，保证"保存 → 重新打开"能看到真实往返，而不是假装成功。
+const mockAgentLLMBindings = new Map<
+  string,
+  { profile_id: string | null; model_mode: "channel-default" | "fixed-model"; model_id: string | null }
+>();
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
 
@@ -815,6 +825,24 @@ function mockProfileResolution(profileID: number | undefined, source: TaskLLMRes
   };
 }
 
+// mockActiveMember 把配置态三元组解析成"实际生效成员"的形状：固定模式用指定成员，
+// 渠道默认模式用该渠道当前默认成员。解析不出可用成员时返回 null——对应后端
+// active_member=null（链耗尽/渠道无可用默认模型），界面必须如实显示而不是拿第一项充数。
+function mockActiveMember(sel: NonNullable<Task["members"]>[number]): LLMActiveMember | null {
+  const models = mockLLMModels[String(sel.profile_id)]?.models ?? [];
+  const picked = sel.model_mode === "fixed-model" ? models.find((m) => m.id === String(sel.model_id)) : undefined;
+  const resolved = picked ?? (sel.model_mode === "fixed-model" ? undefined : models.find((m) => m.is_default));
+  if (!resolved) return null;
+  return {
+    profile_id: String(sel.profile_id),
+    model_mode: picked ? "fixed-model" : "channel-default",
+    model_id: resolved.id,
+    upstream_model_id: resolved.upstream_model_id,
+    display_name: resolved.display_name,
+    member_key: `${sel.profile_id}:${resolved.id}`,
+  };
+}
+
 // Mirrors the backend precedence in server/task_resolution.go:
 // Agent 绑定 → 任务 LLM 配置链 → 全局配置 → 环境配置。
 function mockRoleResolution(task: Task, agentKey: "mainagent" | "planner" | "worker"): TaskLLMResolution {
@@ -1170,7 +1198,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     while (mockTasks.some((item) => item.id === `t-new-${suffix}`)) suffix++;
     const id = `t-new-${suffix}`;
     const now = new Date();
-    const profileIDs = [...((b.llm_profile_ids as number[] | undefined) ?? [])];
+    // 阶段 2：显式 members 优先（含空数组=继承）；缺省才回退旧的整数链。
+    const members = Array.isArray(b.members) ? (b.members as Task["members"]) : undefined;
+    const profileIDs = members
+      ? members.map((sel) => Number(sel.profile_id))
+      : [...((b.llm_profile_ids as number[] | undefined) ?? [])];
     const sourceTaskIDs = [...((b.source_task_ids as string[] | undefined) ?? [])];
     const companyIDs = [...new Set((b.company_ids as number[] | undefined) ?? [])];
     if (companyIDs.some((companyID) => !mockCompanies.some((company) => company.id === companyID))) {
@@ -1202,6 +1234,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       llm_profile_ids: profileIDs,
       active_llm_profile_id: profileIDs[0],
       llm_failover_state: profileIDs.length ? "ready" : "default",
+      members: members,
+      active_position: members && members.length > 0 ? 0 : null,
+      active_member: members && members.length > 0 ? mockActiveMember(members[0]) : null,
       source_task_ids: sourceTaskIDs,
       company_ids: companyIDs,
     };
@@ -1417,8 +1452,23 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     };
   }
   if (seg[0] === "tasks" && seg[2] === "llm" && m === "PUT") {
-    const ids = [...((b.llm_profile_ids as number[] | undefined) ?? [])];
-    const activeID = typeof b.active_llm_profile_id === "number" ? b.active_llm_profile_id : ids[0];
+    // 阶段 2：members 显式发送（含空数组=恢复继承）时它就是权威；空数组时旧的
+    // 整数链一并清空，避免 DTO 里两套字段互相矛盾。缺省才走旧的 llm_profile_ids。
+    const members = Array.isArray(b.members) ? (b.members as NonNullable<Task["members"]>) : undefined;
+    const ids = members
+      ? members.map((sel) => Number(sel.profile_id))
+      : [...((b.llm_profile_ids as number[] | undefined) ?? [])];
+    // active_position 是零起始下标；越界/缺省时后端选第一项。空链则没有任何生效项。
+    const requestedPosition = typeof b.active_position === "number" ? b.active_position : undefined;
+    const activePosition =
+      members && members.length > 0
+        ? requestedPosition !== undefined && requestedPosition >= 0 && requestedPosition < members.length
+          ? requestedPosition
+          : 0
+        : null;
+    const activeID = typeof b.active_llm_profile_id === "number" ? b.active_llm_profile_id : ids[activePosition ?? 0];
+    const activeMember =
+      members && members.length > 0 && activePosition !== null ? mockActiveMember(members[activePosition]) : null;
     const target = mockTasks.find((item) => item.id === seg[1]);
     if (target) {
       target.llm_profile_ids = ids;
@@ -1426,11 +1476,17 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       target.active_llm_profile_id = activeID;
       target.llm_failover_state = ids.length ? "ready" : "default";
       target.llm_failover_reason = undefined;
+      target.members = members;
+      target.active_position = activePosition;
+      target.active_member = activeMember;
     }
     return {
       id: seg[1],
       llm_profile_ids: ids,
       active_llm_profile_id: activeID,
+      members: members,
+      active_position: activePosition,
+      active_member: activeMember,
       llm_failover_state: ids.length ? "ready" : "default",
       reopened_intents: 0,
     };
@@ -2260,9 +2316,60 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/llm/profiles" && m === "GET") return { profiles: D.llmProfiles };
   if (path === "/llm/profiles" && m === "POST") return { id: Number(b.id) || 3 };
   if (path === "/llm/profiles/active") return { ok: true };
-  if (path === "/llm/pool" && m === "GET") return D.llmPool;
-  if (path === "/llm/pool/reset")
-    return { ...D.llmPool, chain: D.llmPool.chain.map((c) => ({ ...c, state: "ok", fails: 0, cooldown_secs: 0 })) };
+  if (path === "/llm/pool" && m === "GET") return mockLLMPool;
+  if (path === "/llm/pool/reset") {
+    // demo：{id} 只恢复该渠道，不传/0 恢复全部；阶段 2 的 member_key 精确重置到货前，
+    // 这里仍按渠道粒度清状态，与现有行为一致（trips/last_error 不清零，同原实现）。
+    const id = Number(b.id) || 0;
+    for (const c of mockLLMPool.chain) {
+      if (id && c.profile_id !== String(id)) continue;
+      Object.assign(c, { state: "ok", fails: 0, cooldown_secs: 0 });
+    }
+    return mockLLMPool;
+  }
+  if (seg[0] === "llm" && seg[1] === "profiles" && seg[3] === "models" && seg.length === 4 && m === "GET") {
+    const pid = seg[2];
+    return mockLLMModels[pid] ?? { profile_id: pid, default_model_id: null, models: [] };
+  }
+  if (seg[0] === "llm" && seg[1] === "profiles" && seg[3] === "models" && seg.length === 4 && m === "PUT") {
+    const pid = seg[2];
+    const existing = mockLLMModels[pid]?.models ?? [];
+    const byId = new Map(existing.map((item) => [item.id, item]));
+    const byUpstream = new Map(existing.map((item) => [item.upstream_model_id, item]));
+    let nextId = 100 + Object.values(mockLLMModels).reduce((n, entry) => n + entry.models.length, 0);
+    const incoming = Array.isArray(b.models) ? b.models : [];
+    const saved = incoming.map((item: Record<string, unknown>) => {
+      const reuse = item.id ? byId.get(String(item.id)) : byUpstream.get(String(item.upstream_model_id));
+      return {
+        id: item.id ? String(item.id) : (reuse?.id ?? String(nextId++)),
+        profile_id: pid,
+        upstream_model_id: String(item.upstream_model_id ?? ""),
+        display_name: String(item.display_name ?? item.upstream_model_id ?? ""),
+        enabled: item.enabled !== false,
+        is_default: item.is_default === true,
+      };
+    });
+    const def = saved.find((item) => item.is_default);
+    mockLLMModels[pid] = { profile_id: pid, default_model_id: def?.id ?? null, models: saved };
+    return mockLLMModels[pid];
+  }
+  if (seg[0] === "llm" && seg[1] === "pool" && seg[2] === "routes" && seg.length === 4 && m === "PUT") {
+    const pid = seg[3];
+    const member = mockLLMPool.chain.find((c) => c.profile_id === pid);
+    if (member) {
+      const models = mockLLMModels[pid]?.models ?? [];
+      const picked = b.model_mode === "fixed-model" ? models.find((mm) => mm.id === String(b.model_id)) : undefined;
+      const resolved = picked ?? models.find((mm) => mm.is_default);
+      member.model_mode = picked ? "fixed-model" : "channel-default";
+      member.model_id = resolved?.id ?? null;
+      if (resolved) {
+        member.model = resolved.upstream_model_id;
+        member.upstream_model_id = resolved.upstream_model_id;
+      }
+      member.member_key = `${pid}:${resolved?.id ?? ""}`;
+    }
+    return { ok: true };
+  }
   if (seg[0] === "llm" && seg[1] === "profiles" && seg.length === 3 && m === "DELETE")
     return { deleted: Number(seg[2]) };
 
@@ -2277,13 +2384,88 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       builtin: false,
       enabled: true,
     };
-  if (seg[0] === "agents" && seg.length === 2 && m === "GET") return D.agentDetail(seg[1]);
+  if (seg[0] === "agents" && seg.length === 2 && m === "GET") {
+    const detail = D.agentDetail(seg[1]);
+    const binding = mockAgentLLMBindings.get(seg[1]);
+    if (!binding) return detail;
+    // 合并已保存的三元组绑定；同时把旧的整数字段对齐，避免两套字段互相矛盾。
+    return {
+      ...detail,
+      agent: {
+        ...detail.agent,
+        profile_id: binding.profile_id,
+        model_mode: binding.model_mode,
+        model_id: binding.model_id,
+        llm_profile_id: binding.profile_id === null ? null : Number(binding.profile_id),
+      },
+    };
+  }
   if (seg[0] === "agents" && seg[2] === "triggers" && m === "GET") return { triggers: [] };
   if (seg[0] === "agents" && seg[2] === "prompts") return { versions: D.agentDetail(seg[1]).versions };
   if (seg[0] === "agents" && seg[2] === "variables") return { variables: D.agentDetail(seg[1]).variables };
   if (seg[0] === "agents" && seg[2] === "prompt" && seg[3] === "preview")
     return { rendered: String(b.template ?? "").replace(/\{\{\.(\w+)\}\}/g, "«$1»") };
   if (seg[0] === "agents" && seg[2] === "visibility" && m === "GET") return D.agentDetail(seg[1]).visibility;
+
+  // ── proxies（代理中心）──
+  // demo 目录里保留一条未注册的 WARP，让"注册需先确认条款"这条交互可被实际操作/截图；
+  // register 缺少 accept_terms:true 直接拒绝，与真实后端规则一致。
+  if (path === "/proxies" && m === "GET") return { proxies: mockProxies, global_proxy_id: 1 };
+  if (path === "/proxies" && m === "POST") return { id: Number(b.id) || 1 };
+  if (path === "/proxies/global" && m === "PUT")
+    return { global_proxy_id: typeof b.proxy_id === "number" ? b.proxy_id : null };
+  if (seg[0] === "proxies" && seg[2] === "warp" && seg.length === 4) {
+    const action = seg[3];
+    if (action === "register" && b.accept_terms !== true) {
+      // 契约：后端不接受缺失/false；mock 用同样规则，避免前端漏传也"看起来通过"。
+      throw new Error("register: accept_terms must be true");
+    }
+    return { id: Number(seg[1]), name: "WARP", kind: "warp", enabled: true, status: "stopped" };
+  }
+  if (seg[0] === "proxies" && seg.length === 3 && m === "DELETE") return { deleted: Number(seg[2]) };
+  if (seg[0] === "proxies" && seg[2] === "test")
+    return { id: Number(seg[1]), name: "代理", kind: "http", enabled: true, status: "healthy" };
+
+  // ── agents 配置更新 ──
+  // 阶段 2：Agent 绑定支持渠道+模型三元组。profile_id 缺省时保留旧绑定；null 解绑；
+  // 只传模型字段可调整当前绑定渠道的选择（未绑定渠道则拒绝，与后端 400 一致）。
+  if (seg[0] === "agents" && seg[2] === "config" && seg.length === 4 && m === "PUT") {
+    const agent = D.agents.find((item) => item.key === seg[1]);
+    if (!agent) throw new Error("Agent 不存在");
+    const overrides = mockAgentLLMBindings.get(seg[1]) ?? {
+      profile_id: agent.profile_id ?? (agent.llm_profile_id != null ? String(agent.llm_profile_id) : null),
+      model_mode: agent.model_mode ?? "channel-default",
+      model_id: agent.model_id ?? null,
+    };
+    if ("profile_id" in b) {
+      if (b.profile_id === null) {
+        overrides.profile_id = null;
+        overrides.model_mode = "channel-default";
+        overrides.model_id = null;
+      } else {
+        overrides.profile_id = String(b.profile_id);
+        overrides.model_mode = b.model_mode === "fixed-model" ? "fixed-model" : "channel-default";
+        overrides.model_id = b.model_mode === "fixed-model" && b.model_id != null ? String(b.model_id) : null;
+      }
+    } else if (b.model_mode !== undefined) {
+      if (!overrides.profile_id) throw new Error("未绑定渠道时不能只修改模型选择");
+      overrides.model_mode = b.model_mode === "fixed-model" ? "fixed-model" : "channel-default";
+      overrides.model_id = b.model_mode === "fixed-model" && b.model_id != null ? String(b.model_id) : null;
+    } else if ("llm_profile_id" in b) {
+      // 旧的单一字段：整数=绑定该渠道默认模型，null=解绑。
+      if (b.llm_profile_id === null) {
+        overrides.profile_id = null;
+        overrides.model_mode = "channel-default";
+        overrides.model_id = null;
+      } else if (typeof b.llm_profile_id === "number") {
+        overrides.profile_id = String(b.llm_profile_id);
+        overrides.model_mode = "channel-default";
+        overrides.model_id = null;
+      }
+    }
+    mockAgentLLMBindings.set(seg[1], overrides);
+    return { ok: true, ...overrides };
+  }
 
   // ── conversations ──
   if (path === "/conversations" && m === "GET") {
@@ -2302,6 +2484,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/conversations" && m === "POST") {
     const now = new Date().toISOString();
     const title = String(b.title ?? "").trim() || "新对话";
+    // 阶段 2：创建时可带渠道+模型三元组。profile_id 缺省时回退旧的整数 llm_profile_id，
+    // 两者都按"渠道默认模型"解释，与后端兼容规则一致。
+    const hasNew = typeof b.profile_id === "string" || b.profile_id === null;
     const conversation: Conversation = {
       id: mockConversations.reduce((max, item) => Math.max(max, item.id), 0) + 1,
       agent_key: String(b.agent_key ?? "mainagent"),
@@ -2311,8 +2496,61 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       created_at: now,
       updated_at: now,
     };
+    if (hasNew) {
+      if (b.profile_id === null) {
+        conversation.profile_id = null;
+        conversation.model_mode = null;
+        conversation.model_id = null;
+        conversation.llm_profile_id = undefined;
+      } else {
+        conversation.profile_id = String(b.profile_id);
+        conversation.llm_profile_id = Number(b.profile_id) || undefined;
+        conversation.model_mode = b.model_mode === "fixed-model" ? "fixed-model" : "channel-default";
+        conversation.model_id = b.model_mode === "fixed-model" && b.model_id != null ? String(b.model_id) : null;
+      }
+    }
     mockConversations.unshift(conversation);
     return structuredClone(conversation);
+  }
+  // 对话的渠道+模型覆盖：PATCH /conversations/{id}/profile
+  // profile_id:null 清除覆盖(继承 Agent 绑定再回退全局)；只传模型字段调整当前渠道选择。
+  if (seg[0] === "conversations" && seg[2] === "profile" && seg.length === 4 && m === "PATCH") {
+    const conversation = mockConversations.find((item) => item.id === Number(seg[1]));
+    if (!conversation) return {};
+    if (typeof b.llm_profile_id === "number" || b.llm_profile_id === null) {
+      conversation.llm_profile_id = b.llm_profile_id ?? undefined;
+    }
+    if ("profile_id" in b) {
+      if (b.profile_id === null) {
+        // 清除覆盖：旧的数字覆盖也一并清掉，避免两套字段互相矛盾。
+        conversation.profile_id = null;
+        conversation.model_mode = null;
+        conversation.model_id = null;
+        conversation.llm_profile_id = undefined;
+      } else {
+        conversation.profile_id = String(b.profile_id);
+        conversation.llm_profile_id = Number(b.profile_id) || undefined;
+        if (b.model_mode === "fixed-model") {
+          conversation.model_mode = "fixed-model";
+          conversation.model_id = b.model_id == null ? null : String(b.model_id);
+        } else {
+          conversation.model_mode = "channel-default";
+          conversation.model_id = null;
+        }
+      }
+    } else if (b.model_mode !== undefined) {
+      // 只调模型：必须已绑定渠道，否则按契约返回 400。
+      if (!conversation.profile_id) throw new Error("未绑定渠道时不能只修改模型选择");
+      if (b.model_mode === "fixed-model") {
+        conversation.model_mode = "fixed-model";
+        conversation.model_id = b.model_id == null ? null : String(b.model_id);
+      } else {
+        conversation.model_mode = "channel-default";
+        conversation.model_id = null;
+      }
+    }
+    conversation.updated_at = new Date().toISOString();
+    return { ok: true };
   }
   if (seg[0] === "conversations" && seg.length === 2 && m === "PATCH") {
     const conversation = mockConversations.find((item) => item.id === Number(seg[1]));
