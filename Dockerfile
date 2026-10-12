@@ -48,9 +48,8 @@ FROM ${BINARY_STAGE} AS binary
 FROM python:3.12-slim-bookworm
 ARG TARGETARCH
 ARG NPM_REGISTRY=https://registry.npmmirror.com
-# 运行层的全局 npm 装包与 chromium 下载同样走国内源（对全球网络同样可达）
-ENV npm_config_registry=$NPM_REGISTRY \
-    PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+# 浏览器使用 Playwright 官方默认下载路径，避免镜像站缺少新版本资产。
+ENV npm_config_registry=$NPM_REGISTRY
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
 RUN apt-get update && apt-get install -y --no-install-recommends \

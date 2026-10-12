@@ -124,6 +124,8 @@ jobs:
         run: |
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           echo "REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Use official browser downloads for older release tags
+        run: sed -i 's#https://cdn.npmmirror.com/binaries/playwright##g' Dockerfile
       - uses: actions/download-artifact@v4
         with:
           name: bin-linux-${{ matrix.arch }}
