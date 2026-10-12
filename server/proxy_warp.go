@@ -20,6 +20,15 @@ func (s *Server) warpAction(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid proxy id")
 		return
 	}
+	pending, err := s.m.pg.WarpCreatePending(id)
+	if err != nil {
+		writeErr(w, 500, "无法读取 WARP 创建状态")
+		return
+	}
+	if pending {
+		writeErr(w, 409, "WARP 创建尚未完成，请使用原 Idempotency-Key 查询结果")
+		return
+	}
 	var req struct {
 		AcceptTerms bool `json:"accept_terms"`
 	}

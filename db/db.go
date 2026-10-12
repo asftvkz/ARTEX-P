@@ -166,6 +166,9 @@ func Open(dsn string) (*DB, error) {
 		if err := d.MigrateLLMProfileProxies(context.Background()); err != nil {
 			return fmt.Errorf("migrate LLM profile proxies: %w", err)
 		}
+		if err := d.MigrateWarpCreateRequests(context.Background()); err != nil {
+			return fmt.Errorf("migrate WARP create requests: %w", err)
+		}
 		if err := d.seedBuiltins(); err != nil {
 			return fmt.Errorf("seed builtins: %w", err)
 		}

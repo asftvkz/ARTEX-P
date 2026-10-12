@@ -10,12 +10,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +27,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/google/uuid"
 )
 
 // 合成工具只处理本地文件和回环连接，绝不转发 SOCKS 请求到外网。
@@ -52,6 +55,15 @@ func TestWarpToolProcess(t *testing.T) {
 	if tool == "wgcf" {
 		if len(args) == 4 && args[2] == "register" && args[3] == "--accept-tos" {
 			logCall("register")
+			if mode == "register-block" {
+				gate := os.Getenv("ARTEX_WARP_REGISTER_GATE")
+				for {
+					if _, err := os.Stat(gate); os.IsNotExist(err) {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
 			if mode == "register-fail" {
 				fmt.Fprintln(os.Stderr, "synthetic-private-token")
 				os.Exit(42)
@@ -245,7 +257,7 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 			logPath := filepath.Join(t.TempDir(), "calls.log")
 			t.Setenv("ARTEX_WARP_CALL_LOG", logPath)
 			t.Setenv("ARTEX_WARP_FIXTURE_MODE", mode)
-			code, out, raw := proxyAPI(t, mux, "POST", "/api/proxies", `{"name":"一次确认WARP","kind":"warp","accept_terms":true}`)
+			code, out, raw := warpCreateHTTP(t, mux, uuid.NewString(), `{"name":"一次确认WARP","kind":"warp","accept_terms":true}`, false)
 			want := 201
 			if mode != "ready" {
 				want = 502
@@ -258,7 +270,12 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 			if !ok {
 				t.Fatalf("未保留已建proxy DTO: %d %s", code, raw)
 			}
-			t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM outbound_proxies WHERE id=$1`, int64(id)) })
+			t.Cleanup(func() {
+				if rt, err := s.m.proxyRuntime(); err == nil {
+					_, _ = rt.warp.Stop(t.Context(), warpProfileID(int64(id)))
+				}
+				_ = s.m.pg.DeleteProxy(int64(id))
+			})
 			if code != want {
 				t.Fatalf("创建未完成运行链或失败状态不准确: %d %s", code, raw)
 			}
@@ -389,13 +406,18 @@ func TestProxyPGWarpRuntimeRecovery(t *testing.T) {
 			logPath := filepath.Join(t.TempDir(), "calls.log")
 			t.Setenv("ARTEX_WARP_CALL_LOG", logPath)
 			t.Setenv("ARTEX_WARP_FIXTURE_MODE", "ready")
-			code, out, raw := proxyAPI(t, mux, "POST", "/api/proxies", `{"name":"运行恢复回归","kind":"warp","accept_terms":true}`)
+			code, out, raw := warpCreateHTTP(t, mux, uuid.NewString(), `{"name":"运行恢复回归","kind":"warp","accept_terms":true}`, false)
 			if code != 201 {
 				t.Fatalf("创建失败: %d %s", code, raw)
 			}
 			id := int64(out["id"].(float64))
 			path := fmt.Sprintf("/api/proxies/%d", id)
-			t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM outbound_proxies WHERE id=$1`, id) })
+			t.Cleanup(func() {
+				if rt, err := s.m.proxyRuntime(); err == nil {
+					_, _ = rt.warp.Stop(t.Context(), warpProfileID(id))
+				}
+				_ = s.m.pg.DeleteProxy(id)
+			})
 			if scenario == "probe-recovery" {
 				createRuntimeTask(t, s, db.TaskProxyModeFixed, &id)
 				marker := filepath.Join(os.Getenv("ARTEX_WARP_DIR"), warpProfileID(id), "synthetic-bad-probe")
@@ -448,6 +470,81 @@ func TestProxyPGWarpRuntimeRecovery(t *testing.T) {
 	}
 }
 
+func TestProxyPGWarpActionSingleConnection(t *testing.T) {
+	if warpFixtureSubprocess(t) {
+		return
+	}
+	t.Setenv("ARTEX_PG_DSN", os.Getenv("ARTEX_WARP_CHILD_DSN"))
+	s, mux := proxyIntegration(t)
+	t.Setenv("ARTEX_WARP_CALL_LOG", filepath.Join(t.TempDir(), "calls.log"))
+	t.Setenv("ARTEX_WARP_FIXTURE_MODE", "ready")
+	code, out, raw := warpCreateHTTP(t, mux, uuid.NewString(), `{"name":"单连接WARP操作","kind":"warp","accept_terms":true}`, false)
+	if code != 201 {
+		t.Fatalf("创建失败: %d %s", code, raw)
+	}
+	id := int64(out["id"].(float64))
+	t.Cleanup(func() {
+		if err := s.m.pg.DeleteProxy(id); err != nil {
+			t.Errorf("清理单连接测试代理: %v", err)
+		}
+	})
+	s.m.pg.SetMaxOpenConns(1)
+	t.Cleanup(func() { s.m.pg.SetMaxOpenConns(2) })
+	// 超时仅放宽本测试池以解除旧实现死锁，等待请求退出后再清理夹具。
+	for _, action := range []string{"stop", "start"} {
+		t.Run(action, func(t *testing.T) {
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			type result struct {
+				response *http.Response
+				err      error
+			}
+			done := make(chan result, 1)
+			before := s.m.pg.Stats().WaitCount
+			go func() {
+				resp, err := srv.Client().Post(fmt.Sprintf("%s/api/proxies/%d/warp/%s", srv.URL, id, action), "application/json", nil)
+				done <- result{resp, err}
+			}()
+			var got result
+			select {
+			case got = <-done:
+			case <-time.After(2 * time.Second):
+				waits := s.m.pg.Stats().WaitCount - before
+				s.m.pg.SetMaxOpenConns(2)
+				wakeCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+				wakeErr := s.m.pg.PingContext(wakeCtx)
+				cancel()
+				if wakeErr != nil {
+					t.Errorf("唤醒测试连接池失败: %v", wakeErr)
+				}
+				got = <-done
+				t.Errorf("单连接WARP action死锁，事务内重复借连接: action=%s waits=%d", action, waits)
+			}
+			if got.err != nil {
+				t.Fatal(got.err)
+			}
+			defer got.response.Body.Close()
+			data, err := io.ReadAll(got.response.Body)
+			if err != nil || got.response.StatusCode != 200 {
+				t.Fatalf("正式WARP action失败: %d %s %v", got.response.StatusCode, data, err)
+			}
+			var dto ProxyDTO
+			if err := json.Unmarshal(data, &dto); err != nil {
+				t.Fatal(err)
+			}
+			if dto.ID != id || (action == "stop" && (dto.Status != "stopped" || dto.EgressIP != "")) || (action == "start" && (dto.Status != "healthy" || dto.EgressIP != "198.51.100.42")) {
+				t.Fatalf("操作DTO状态错误: %s", data)
+			}
+			if s.m.pg.Stats().WaitCount != before {
+				t.Error("事务内仍额外申请数据库连接")
+			}
+		})
+		if t.Failed() {
+			break
+		}
+	}
+}
+
 func TestProxyPGWarpChannelDeletePreservesProfile(t *testing.T) {
 	if warpFixtureSubprocess(t) {
 		return
@@ -458,13 +555,18 @@ func TestProxyPGWarpChannelDeletePreservesProfile(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "calls.log")
 	t.Setenv("ARTEX_WARP_CALL_LOG", logPath)
 	t.Setenv("ARTEX_WARP_FIXTURE_MODE", "ready")
-	code, out, raw := proxyAPI(t, mux, "POST", "/api/proxies", `{"name":"渠道引用删除保护","kind":"warp","accept_terms":true}`)
+	code, out, raw := warpCreateHTTP(t, mux, uuid.NewString(), `{"name":"渠道引用删除保护","kind":"warp","accept_terms":true}`, false)
 	if code != 201 {
 		t.Fatalf("创建失败: %d %s", code, raw)
 	}
 	id := int64(out["id"].(float64))
 	path := fmt.Sprintf("/api/proxies/%d", id)
-	t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM outbound_proxies WHERE id=$1`, id) })
+	t.Cleanup(func() {
+		if rt, err := s.m.proxyRuntime(); err == nil {
+			_, _ = rt.warp.Stop(t.Context(), warpProfileID(id))
+		}
+		_ = s.m.pg.DeleteProxy(id)
+	})
 	profileID, err := s.m.pg.SaveProfile(&db.LLMProfile{Name: "WARP渠道引用", Format: "openai", Model: "synthetic", ProxyMode: "fixed", ProxyID: &id})
 	if err != nil {
 		t.Fatal(err)

@@ -112,6 +112,7 @@ import type {
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
+import { WARP_IDEMPOTENCY_KEY } from "@/lib/warp-create-intent";
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -129,7 +130,7 @@ export class APIError extends Error {
   }
 }
 
-export async function http<T>(path: string, init?: RequestInit): Promise<T> {
+export async function http<T>(path: string, init?: RequestInit, acceptedIsPending = false): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
   const r = await fetch(`/api${path}`, {
@@ -148,7 +149,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error("未授权");
   }
-  if (!r.ok) {
+  if (!r.ok || (acceptedIsPending && r.status === 202)) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
     let payload: unknown;
@@ -302,7 +303,21 @@ export const api = {
       proxy_id: input.proxyId ?? null,
     }),
   proxies: () => get<{ proxies: import("./types").ProxyRecord[]; global_proxy_id: number | null }>("/proxies"),
-  createProxy: (input: ProxyWriteInput) => post<ProxyRecord>("/proxies", input),
+  createProxy: (input: ProxyWriteInput, idempotencyKey?: string) => {
+    if (input.kind === "warp" && (!idempotencyKey || !WARP_IDEMPOTENCY_KEY.test(idempotencyKey))) {
+      throw new Error("新增 WARP 必须使用已保存的请求编号");
+    }
+    // key 由创建意图持有；适配器绝不能在请求或重试时生成新 key。
+    return http<ProxyRecord>(
+      "/proxies",
+      {
+        method: "POST",
+        headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
+        body: JSON.stringify(input),
+      },
+      true,
+    );
+  },
   proxy: (id: number) => get<ProxyRecord>(`/proxies/${id}`),
   updateProxy: (id: number, input: ProxyWriteInput) => put<ProxyRecord>(`/proxies/${id}`, input),
   deleteProxy: (id: number) => del<{ deleted: number }>(`/proxies/${id}`),

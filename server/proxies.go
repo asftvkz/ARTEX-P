@@ -1,9 +1,12 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +14,7 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
+	"github.com/google/uuid"
 )
 
 type proxyRequest struct {
@@ -46,13 +50,31 @@ func (s *Server) listProxies(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeErr(w, 400, "bad json: "+err.Error())
+		return
+	}
 	var req proxyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(raw, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
 	p := proxyFromRequest(req)
 	if p.Kind == db.ProxyKindWarp {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			writeErr(w, 400, "WARP 创建请求必须为 JSON 对象")
+			return
+		}
+		for field := range fields {
+			switch field {
+			case "name", "kind", "accept_terms", "enabled":
+			default:
+				writeErr(w, 400, "WARP 创建只接受名称、类型、条款确认和启用状态")
+				return
+			}
+		}
 		if !req.AcceptTerms {
 			writeErr(w, 400, "请先阅读并接受 Cloudflare WARP 条款")
 			return
@@ -61,25 +83,92 @@ func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "WARP 名称不能超过 80 字节，创建时必须启用")
 			return
 		}
-		if _, err := s.m.proxyRuntime(); err != nil {
-			writeErr(w, 503, "代理运行时未初始化")
+		keys := r.Header.Values("Idempotency-Key")
+		if len(keys) != 1 {
+			writeErr(w, 400, "WARP 创建需要 UUID Idempotency-Key")
 			return
 		}
+		key := strings.TrimSpace(keys[0])
+		parsed, err := uuid.Parse(key)
+		if err != nil || parsed.String() != strings.ToLower(key) {
+			writeErr(w, 400, "WARP 创建需要 UUID Idempotency-Key")
+			return
+		}
+		s.createWarpProxy(w, r, p, req, parsed.String())
+		return
 	}
 	created, err := s.m.pg.CreateProxy(p)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if created.Kind == db.ProxyKindWarp {
-		ready, err := s.performWarpAction(r.Context(), created.ID, "register", req.AcceptTerms)
-		if err != nil {
-			s.writeWarpFailure(w, created.ID, err)
-			return
-		}
-		created = ready
-	}
 	writeJSON(w, 201, s.runtimeProxyDTO(created))
+}
+
+func (s *Server) createWarpProxy(w http.ResponseWriter, r *http.Request, p *db.Proxy, req proxyRequest, key string) {
+	payload, err := json.Marshal(struct {
+		Name        string       `json:"name"`
+		Kind        db.ProxyKind `json:"kind"`
+		AcceptTerms bool         `json:"accept_terms"`
+		Enabled     bool         `json:"enabled"`
+	}{Name: p.Name, Kind: p.Kind, AcceptTerms: req.AcceptTerms, Enabled: p.Enabled})
+	if err != nil {
+		writeErr(w, 400, "WARP 创建请求无效")
+		return
+	}
+	hash := sha256.Sum256(payload)
+	created, intent, err := s.m.pg.CreateWarpProxyOnce(key, hash, p)
+	if err != nil {
+		switch {
+		case errors.Is(err, db.ErrWarpCreateConflict), errors.Is(err, db.ErrProxyInUse):
+			writeErr(w, 409, "Idempotency-Key 已用于不同的 WARP 创建请求")
+		case errors.Is(err, db.ErrWarpCreateGone):
+			writeErr(w, 410, "该 WARP 创建记录已删除，请使用新的创建意图")
+		default:
+			writeErr(w, 400, err.Error())
+		}
+		return
+	}
+	if !intent.Created {
+		switch intent.State {
+		case "succeeded":
+			writeJSON(w, 201, s.runtimeProxyDTO(created))
+		case "failed":
+			writeJSON(w, 502, map[string]any{"error": "WARP 创建未成功；请核对原档案，不要重复注册", "proxy_id": intent.ProxyID, "proxy": s.runtimeProxyDTO(created), "operation_status": "failed"})
+		default:
+			writeJSON(w, 202, map[string]any{"proxy_id": intent.ProxyID, "proxy": proxyDTO(created), "operation_status": "pending"})
+		}
+		return
+	}
+
+	// 注册只属于首次创建者；数据库事务已提交，网络操作不占生命周期锁。
+	rt, err := s.m.proxyRuntime()
+	var connection *db.Proxy
+	if err == nil {
+		_, err = rt.warp.Create(r.Context(), warpProfileID(created.ID), created.Name, req.AcceptTerms)
+		if err == nil {
+			c, connectionErr := rt.warp.Connection(warpProfileID(created.ID))
+			err = connectionErr
+			if err == nil {
+				connection = &db.Proxy{Host: c.Host, Port: c.Port, Username: c.Username, Password: c.Password}
+				connection.URL = (&url.URL{Scheme: "socks5", Host: net.JoinHostPort(c.Host, strconv.Itoa(c.Port)), User: url.UserPassword(c.Username, c.Password)}).String()
+			}
+		}
+	}
+	failure := ""
+	if err != nil {
+		failure = safeProxyRuntimeError(err)
+	}
+	completed, completeErr := s.m.pg.CompleteWarpProxyCreate(key, created.ID, intent.ExecutionToken, connection, failure)
+	if completeErr != nil {
+		writeJSON(w, 502, map[string]any{"error": "WARP 创建结果未能持久化；请核对原档案，不要重新注册", "proxy_id": created.ID, "proxy": proxyDTO(created), "operation_status": "pending"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, 502, map[string]any{"error": "WARP 创建未成功；请核对原档案，不要重复注册", "proxy_id": completed.ID, "proxy": s.runtimeProxyDTO(completed), "operation_status": "failed"})
+		return
+	}
+	writeJSON(w, 201, s.runtimeProxyDTO(completed))
 }
 
 func (s *Server) getProxy(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +200,11 @@ func (s *Server) updateProxy(w http.ResponseWriter, r *http.Request) {
 	p.ID = id
 	updated, err := s.m.pg.UpdateProxyWithOptions(p, db.ProxyUpdateOptions{URL: req.URL, Password: req.Password, AdminToken: req.ResinAdminToken, ClearPassword: req.ClearPassword, ClearAdminToken: req.ClearAdminToken, Enabled: req.Enabled})
 	if err != nil {
-		writeErr(w, 400, err.Error())
+		if errors.Is(err, db.ErrProxyInUse) {
+			writeErr(w, 409, "代理正在创建或被引用")
+		} else {
+			writeErr(w, 400, err.Error())
+		}
 		return
 	}
 	writeJSON(w, 200, s.runtimeProxyDTO(updated))
@@ -164,6 +257,17 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "代理不存在")
 		return
 	}
+	if p.Kind == db.ProxyKindWarp {
+		pending, err := s.m.pg.WarpCreatePending(id)
+		if err != nil {
+			writeErr(w, 500, "无法读取 WARP 创建状态")
+			return
+		}
+		if pending {
+			writeErr(w, 409, "WARP 创建尚未完成，请使用原 Idempotency-Key 查询结果")
+			return
+		}
+	}
 	var probeErr error
 	if p.Kind == db.ProxyKindWarp {
 		rt, runtimeErr := s.m.proxyRuntime()
@@ -186,7 +290,11 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 	p.Status, p.LastError, p.LastCheckedAt = status, message, &now
 	// Preserve secrets by using the store's update path with the existing values.
 	if err := s.m.pg.SetProxyStatus(id, status, message, now); err != nil {
-		writeErr(w, 500, err.Error())
+		if errors.Is(err, db.ErrProxyInUse) {
+			writeErr(w, 409, "WARP 创建状态已改变，请刷新后重试")
+		} else {
+			writeErr(w, 500, err.Error())
+		}
 		return
 	}
 	if probeErr != nil {

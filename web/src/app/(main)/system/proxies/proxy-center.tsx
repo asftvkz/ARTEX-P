@@ -19,7 +19,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { api } from "@/lib/api";
+import { APIError, api } from "@/lib/api";
 import {
   buildProxyPayload,
   proxyEndpoint as endpoint,
@@ -35,6 +35,8 @@ import {
   warpReady,
 } from "@/lib/proxy-center";
 import type { ProxyKind, ProxyRecord } from "@/lib/types";
+import { WarpCreateIntent, type WarpCreateStage, type WarpIntent } from "@/lib/warp-create-intent";
+import { warpCreateFailure } from "@/lib/warp-create-result";
 
 const KINDS: Array<{ value: ProxyKind; label: string }> = [
   { value: "http", label: "HTTP" },
@@ -81,12 +83,56 @@ export function ProxyCenter() {
   const [busy, setBusy] = React.useState("");
   const mutationLock = React.useRef(false);
   const [saveError, setSaveError] = React.useState("");
-  const [createUncertain, setCreateUncertain] = React.useState(false);
+  const [warpCreation] = React.useState(() => new WarpCreateIntent());
+  const [createIntent, setCreateIntent] = React.useState<WarpIntent | null>(null);
+  const [createStage, setCreateStage] = React.useState<WarpCreateStage>("draft");
+  const [intentStorageError, setIntentStorageError] = React.useState("正在读取本地 WARP 意图…");
+  const [pendingID, setPendingID] = React.useState<number | null>(null);
+  const [pollAttempt, setPollAttempt] = React.useState(0);
+  const pollLock = React.useRef(false);
   const [registrationUncertain, setRegistrationUncertain] = React.useState<number[]>([]);
   // WARP 注册条款确认：registering 记录待确认的代理编号；acceptTerms 必须由用户
   // 手动勾选（每次打开都重置为 false，绝不预选）。
   const [registering, setRegistering] = React.useState<number | null>(null);
   const [acceptTerms, setAcceptTerms] = React.useState(false);
+
+  const restoreIntent = React.useCallback(() => {
+    try {
+      const intent = warpCreation.restore();
+      setCreateIntent(intent);
+      setCreateStage(warpCreation.stage);
+      setIntentStorageError("");
+      if (intent) setForm({ ...freshForm(), kind: "warp", name: intent.name });
+    } catch {
+      setIntentStorageError("无法读取本地 WARP 意图，已暂停新增。请重试读取并核对原代理，勿重复新建。");
+    }
+  }, [warpCreation]);
+  React.useEffect(restoreIntent, [restoreIntent]);
+
+  const finishCreation = React.useCallback(
+    (stage: WarpCreateStage) => {
+      warpCreation.finish(stage);
+      setCreateStage(stage);
+      setCreateIntent(warpCreation.intent);
+    },
+    [warpCreation],
+  );
+
+  const newWarpIntent = () => {
+    if (mutationLock.current) return;
+    try {
+      if (!warpCreation.newIntent()) return;
+      setCreateIntent(null);
+      setCreateStage("draft");
+      setPendingID(null);
+      setEditing(null);
+      setForm({ ...freshForm(), kind: "warp" });
+      setSaveError("");
+      setIntentStorageError("");
+    } catch {
+      setIntentStorageError("无法清理原意图，已保留原请求编号。请重试读取本地存储。");
+    }
+  };
 
   const reload = React.useCallback(async () => {
     const result = await api.proxies();
@@ -113,18 +159,75 @@ export function ProxyCenter() {
       active = false;
     };
   }, []);
+  React.useEffect(() => {
+    if (createStage !== "pending" || !createIntent || pollAttempt === 0) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    let attempts = 0;
+    const intent = createIntent;
+    const poll = async () => {
+      if (pollLock.current) {
+        timer = setTimeout(() => void poll(), 2000);
+        return;
+      }
+      pollLock.current = true;
+      try {
+        // GET 只有运行 DTO，不能判断创建操作是否已持久化完成；同 key 重放才是权威结果。
+        const item = await api.createProxy(
+          { name: intent.name, kind: "warp", accept_terms: intent.accept_terms },
+          intent.key,
+        );
+        if (!active || !warpCreation.isCurrent(intent)) return;
+        if (pendingID !== null && item.id !== pendingID) throw new Error("返回的代理编号不一致");
+        setItems((prev) => [item, ...prev.filter((entry) => entry.id !== item.id)]);
+        if (warpReady(item)) {
+          finishCreation("complete");
+          setPendingID(item.id);
+          setSaveError("");
+          toast.success(`WARP #${item.id} 已连接 · 出口 ${item.egress_ip}`);
+          return;
+        }
+        finishCreation("retained");
+        setEditing(item);
+        setSaveError(`WARP #${item.id} 已建档，当前未连接；请核对原条目，不会重新注册。`);
+      } catch (error) {
+        if (!active || !warpCreation.isCurrent(intent)) return;
+        const result = warpCreateFailure(error);
+        if (result.stage === "pending") {
+          if (result.id !== null) setPendingID(result.id);
+          const proxy = result.proxy;
+          if (proxy) setItems((prev) => [proxy, ...prev.filter((item) => item.id !== proxy.id)]);
+          if (++attempts < 30) timer = setTimeout(() => void poll(), 2000);
+          else setSaveError("原请求仍在处理中，可继续核对进度；不会重新注册。");
+        } else if (result.stage === "retained") {
+          finishCreation("retained");
+          setEditing(result.proxy);
+          setSaveError(`WARP #${result.proxy.id} 已保留：${errorText(error)}。请恢复此条目。`);
+        } else if (result.stage === "deleted" || result.stage === "conflict") {
+          finishCreation(result.stage);
+          setSaveError(`原请求已删除或冲突：${errorText(error)}。不会自动更换请求编号。`);
+        } else setSaveError(`原请求状态暂时无法确认，可继续核对进度：${errorText(error)}`);
+      } finally {
+        pollLock.current = false;
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [createStage, pendingID, pollAttempt, finishCreation, warpCreation, createIntent]);
   const reset = () => {
     if (mutationLock.current) return;
     setEditing(null);
-    setForm(freshForm());
+    setForm(createIntent ? { ...freshForm(), kind: "warp", name: createIntent.name } : freshForm());
     setSaveError("");
-    setCreateUncertain(false);
   };
   const edit = (item: ProxyRecord) => {
     if (mutationLock.current) return;
+    if (createStage === "pending" && pendingID === item.id) return;
     setEditing(item);
     setSaveError("");
-    setCreateUncertain(false);
     setForm({
       name: item.name,
       kind: item.kind,
@@ -154,11 +257,22 @@ export function ProxyCenter() {
   }
 
   async function save() {
-    if (mutationLock.current || createUncertain) return;
+    if (mutationLock.current) return;
+    if (editing && createStage === "pending" && pendingID === editing.id) return;
+    const creatingWarp = !editing && form.kind === "warp";
+    let intent: WarpIntent | null = null;
     let data: ReturnType<typeof buildProxyPayload>;
     try {
       data = buildProxyPayload(form, !!editing);
+      if (creatingWarp) {
+        if (intentStorageError) return;
+        intent = warpCreation.begin(form.name, data.accept_terms === true);
+        if (!intent) return;
+        setCreateIntent(intent);
+        data = { name: intent.name, kind: "warp", accept_terms: intent.accept_terms };
+      }
     } catch (error) {
+      if (creatingWarp && !warpCreation.storageReady) setIntentStorageError(errorText(error));
       toast.error(errorText(error));
       return;
     }
@@ -166,8 +280,10 @@ export function ProxyCenter() {
     setBusy("save");
     setSaveError("");
     try {
-      const result = editing ? await api.updateProxy(editing.id, data) : await api.createProxy(data);
-      if (!editing && form.kind === "warp" && !warpReady(result)) {
+      const result = editing ? await api.updateProxy(editing.id, data) : await api.createProxy(data, intent?.key);
+      if (intent && !warpCreation.isCurrent(intent)) return;
+      if (creatingWarp && !warpReady(result)) {
+        finishCreation("retained");
         setEditing(result);
         setSaveError(`WARP #${result.id} 已建档，但尚未连接成功。请核对状态并恢复该条目。`);
       } else {
@@ -175,27 +291,45 @@ export function ProxyCenter() {
         if (editing) message = "代理配置已保存";
         else if (form.kind === "warp") message = `WARP 已连接 · 出口 ${result.egress_ip}`;
         toast.success(message);
+        if (creatingWarp) {
+          finishCreation("complete");
+          setPendingID(result.id);
+          setForm({ ...freshForm(), kind: "warp", name: data.name });
+        } else setForm(freshForm());
         setEditing(null);
-        setForm(freshForm());
       }
       await refreshAfterMutation();
     } catch (error) {
+      if (intent && !warpCreation.isCurrent(intent)) return;
       const retained = proxyFromFailure(error);
-      if (retained) {
+      const status = error instanceof APIError ? error.status : undefined;
+      const failure = warpCreateFailure(error);
+      if (creatingWarp && failure.stage === "pending") {
+        finishCreation("pending");
+        setPendingID(failure.id);
+        setPollAttempt((value) => value + 1);
+        setSaveError(`WARP ${failure.id ? `#${failure.id} ` : ""}正在添加 / 连接，正在核对原请求。`);
+      } else if (creatingWarp && (status === 409 || status === 410)) {
+        finishCreation(status === 410 ? "deleted" : "conflict");
+        setSaveError(
+          status === 410
+            ? "原请求对应的代理已删除，此请求编号不能再次创建。需要新出口时请选择新增另一个。"
+            : "原请求与服务端记录冲突，请先核对列表。不会自动更换请求编号重新创建。",
+        );
+      } else if (retained) {
+        if (creatingWarp) finishCreation("retained");
         setEditing(retained);
         setItems((prev) => [retained, ...prev.filter((item) => item.id !== retained.id)]);
         setSaveError(`WARP #${retained.id} 已保留：${errorText(error)}。请恢复此条目，勿重复添加。`);
       } else {
-        const status = (error as { status?: number }).status;
-        const uncertain = !editing && form.kind === "warp" && (!status || status >= 500);
-        setCreateUncertain(uncertain);
+        if (creatingWarp) finishCreation("uncertain");
         setSaveError(
-          uncertain
-            ? `添加结果不确定：${errorText(error)}。请刷新列表核对后编辑已有条目，不要重复提交。`
+          creatingWarp
+            ? `添加结果待确认：${errorText(error)}。可使用原请求编号重试，不会创建另一个出口。`
             : `保存失败：${errorText(error)}`,
         );
       }
-      toast.error(errorText(error));
+      if (status !== 202) toast.error(errorText(error));
     } finally {
       mutationLock.current = false;
       setBusy("");
@@ -235,6 +369,7 @@ export function ProxyCenter() {
   // start/stop/recover 不涉及条款，也不带请求体。
   async function warp(id: number, action: "register" | "start" | "stop" | "recover") {
     if (mutationLock.current) return;
+    if (createStage === "pending" && pendingID === id) return;
     const current = items.find((item) => item.id === id) ?? (editing?.id === id ? editing : null);
     if (
       !current ||
@@ -306,8 +441,16 @@ export function ProxyCenter() {
   }
 
   const global = items.find((item) => item.id === globalID);
+  const creatingWarp = !editing && form.kind === "warp";
+  const creationBlocked = creatingWarp && (!!intentStorageError || !["draft", "uncertain"].includes(createStage));
   let saveLabel = "添加代理";
   if (!editing && form.kind === "warp") saveLabel = "确认添加（同意条款）";
+  if (creatingWarp && createStage === "uncertain") saveLabel = "使用原请求重试（同意条款）";
+  if (creatingWarp && createStage === "complete") saveLabel = "已完成添加";
+  if (creatingWarp && createStage === "pending") saveLabel = "正在添加 / 连接…";
+  if (creatingWarp && createStage === "deleted") saveLabel = "原代理已删除";
+  if (creatingWarp && createStage === "conflict") saveLabel = "请核对原请求";
+  if (creatingWarp && createStage === "retained") saveLabel = "已保留原代理";
   if (editing) saveLabel = "保存修改";
   if (busy === "save") saveLabel = "保存中…";
   if (busy === "save" && form.kind === "warp" && !editing) saveLabel = "正在添加 / 连接…";
@@ -337,7 +480,7 @@ export function ProxyCenter() {
             <Label htmlFor="proxy-name">名称</Label>
             <Input
               id="proxy-name"
-              disabled={!!busy || createUncertain}
+              disabled={!!busy || (creatingWarp && !!createIntent)}
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
             />
@@ -348,7 +491,7 @@ export function ProxyCenter() {
               id="proxy-kind"
               className="h-10 rounded-md border border-input bg-background px-3 text-sm"
               value={form.kind}
-              disabled={!!editing || !!busy || createUncertain}
+              disabled={!!editing || !!busy || (creatingWarp && !!createIntent)}
               onChange={(e) => setForm({ ...form, kind: e.target.value as ProxyKind })}
             >
               {KINDS.map((kind) => (
@@ -395,12 +538,26 @@ export function ProxyCenter() {
             <div className="space-y-2 text-muted-foreground text-sm md:col-span-2">
               {!editing && (
                 <p>
-                  点击“确认添加”表示同意{" "}
+                  点击“确认添加”或“使用原请求重试”表示同意{" "}
                   <a href={WARP_TERMS_URL} target="_blank" rel="noreferrer" className="underline">
                     Cloudflare WARP 服务条款
                   </a>
                   ，并申请注册。轻量 WARP 提供本机 SOCKS5 出口。
                 </p>
+              )}
+              {creatingWarp && createStage === "uncertain" && (
+                <p>已保留「{createIntent?.name}」的添加意图。可核对列表或使用原请求重试；不会生成新请求编号。</p>
+              )}
+              {creatingWarp && createStage === "complete" && (
+                <p role="status">WARP #{pendingID} 已完成添加。需要另一个出口时，请点击“新增另一个”。</p>
+              )}
+              {intentStorageError && (
+                <div role="alert" className="space-y-2 text-destructive">
+                  <p>{intentStorageError}</p>
+                  <Button variant="outline" disabled={!!busy} onClick={restoreIntent}>
+                    重试读取本地意图
+                  </Button>
+                </div>
               )}
               {editing && (
                 <p>
@@ -519,11 +676,29 @@ export function ProxyCenter() {
             </p>
           )}
           <div className="flex gap-2 md:col-span-2">
-            <Button disabled={!!busy || createUncertain} onClick={() => void save()}>
+            <Button disabled={!!busy || creationBlocked} onClick={() => void save()}>
               {saveLabel}
             </Button>
+            {form.kind === "warp" && createIntent && (
+              <Button
+                variant="outline"
+                disabled={!!busy || createStage === "pending" || !!intentStorageError}
+                onClick={newWarpIntent}
+              >
+                新增另一个
+              </Button>
+            )}
+            {creatingWarp && createStage === "pending" && (
+              <Button variant="outline" disabled={!!busy} onClick={() => setPollAttempt((value) => value + 1)}>
+                核对进度 {pendingID ? `#${pendingID}` : ""}
+              </Button>
+            )}
             {editing?.kind === "warp" && warpAllowedActions(editing).includes("recover") && (
-              <Button variant="outline" disabled={!!busy} onClick={() => void warp(editing.id, "recover")}>
+              <Button
+                variant="outline"
+                disabled={!!busy || (createStage === "pending" && pendingID === editing.id)}
+                onClick={() => void warp(editing.id, "recover")}
+              >
                 恢复此出口 #{editing.id}
               </Button>
             )}
@@ -615,7 +790,12 @@ export function ProxyCenter() {
                     >
                       {globalID === item.id ? "全局默认" : "设为默认"}
                     </Button>
-                    <Button size="sm" variant="outline" disabled={!!busy} onClick={() => edit(item)}>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!!busy || (createStage === "pending" && pendingID === item.id)}
+                      onClick={() => edit(item)}
+                    >
                       编辑
                     </Button>
                     <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void test(item.id)}>
@@ -639,6 +819,7 @@ export function ProxyCenter() {
                         variant="outline"
                         disabled={
                           !!busy ||
+                          (createStage === "pending" && pendingID === item.id) ||
                           (action === "register" && registrationUncertain.includes(item.id)) ||
                           (action === "start" && item.status === "healthy") ||
                           (action === "stop" && item.status === "stopped")

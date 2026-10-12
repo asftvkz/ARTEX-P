@@ -8,7 +8,7 @@ import test from "node:test";
 const calls = [];
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (url, init) => {
-  calls.push({ url, body: init.body ? JSON.parse(init.body) : {}, method: init.method });
+  calls.push({ url, body: init.body ? JSON.parse(init.body) : {}, method: init.method, headers: init.headers });
   return Response.json({ id: 7, ok: true, models: ["synthetic-model"] });
 };
 test.after(() => {
@@ -80,11 +80,13 @@ test("API 客户端请求载荷 WARP 新建只发名称/类型/条款接受，�
       { name: " 合成 WARP ", kind: "warp", enabled: false, password: "fake", adminToken: "fake" },
       false,
     ),
+    "11000000-0000-4000-8000-000000000001",
   );
   assert.deepEqual(calls.splice(0)[0], {
     url: "/api/proxies",
     method: "POST",
     body: { name: "合成 WARP", kind: "warp", accept_terms: true },
+    headers: { "Content-Type": "application/json", "Idempotency-Key": "11000000-0000-4000-8000-000000000001" },
   });
 });
 
@@ -93,11 +95,14 @@ test("API 客户端请求载荷 502 保留已建档 DTO/ID；GET 和恢复使用
   const capture = globalThis.fetch;
   globalThis.fetch = async () => Response.json({ error: "连接失败", proxy_id: 31, proxy: item }, { status: 502 });
   try {
-    await assert.rejects(api.createProxy({ name: "失败合成", kind: "warp", accept_terms: true }), (e) => {
-      assert.ok(e instanceof APIError);
-      assert.deepEqual(proxyFromFailure(e), item);
-      return true;
-    });
+    await assert.rejects(
+      api.createProxy({ name: "失败合成", kind: "warp", accept_terms: true }, "11000000-0000-4000-8000-000000000001"),
+      (e) => {
+        assert.ok(e instanceof APIError);
+        assert.deepEqual(proxyFromFailure(e), item);
+        return true;
+      },
+    );
   } finally {
     globalThis.fetch = capture;
   }

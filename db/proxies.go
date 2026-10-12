@@ -361,25 +361,29 @@ func (d *DB) CreateProxy(p *Proxy) (*Proxy, error) {
 	}
 	var out *Proxy
 	err := d.withProxyLifecycle(func(tx *sql.Tx) error {
-		encURL, e := encryptProxySecret(p.URL)
-		if e != nil {
-			return e
-		}
-		encPassword, e := encryptProxySecret(p.Password)
-		if e != nil {
-			return e
-		}
-		encToken, e := encryptProxySecret(p.ResinAdminToken)
-		if e != nil {
-			return e
-		}
-		var scanErr error
-		out, scanErr = scanProxy(tx.QueryRow(`INSERT INTO outbound_proxies(name,kind,url,host,port,username,password,resin_platform,resin_admin_url,resin_admin_token,enabled,status,protocol)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-RETURNING id,name,kind,url,host,port,username,password,resin_platform,resin_admin_url,resin_admin_token,enabled,status,last_error,last_checked_at,created_at,updated_at,protocol`, p.Name, p.Kind, encURL, p.Host, p.Port, p.Username, encPassword, p.ResinPlatform, p.ResinAdminURL, encToken, p.Enabled, initialProxyStatus(p), p.Protocol))
-		return scanErr
+		var err error
+		out, err = insertProxyTx(tx, p)
+		return err
 	})
 	return out, err
+}
+
+func insertProxyTx(tx *sql.Tx, p *Proxy) (*Proxy, error) {
+	encURL, e := encryptProxySecret(p.URL)
+	if e != nil {
+		return nil, e
+	}
+	encPassword, e := encryptProxySecret(p.Password)
+	if e != nil {
+		return nil, e
+	}
+	encToken, e := encryptProxySecret(p.ResinAdminToken)
+	if e != nil {
+		return nil, e
+	}
+	return scanProxy(tx.QueryRow(`INSERT INTO outbound_proxies(name,kind,url,host,port,username,password,resin_platform,resin_admin_url,resin_admin_token,enabled,status,protocol)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+RETURNING id,name,kind,url,host,port,username,password,resin_platform,resin_admin_url,resin_admin_token,enabled,status,last_error,last_checked_at,created_at,updated_at,protocol`, p.Name, p.Kind, encURL, p.Host, p.Port, p.Username, encPassword, p.ResinPlatform, p.ResinAdminURL, encToken, p.Enabled, initialProxyStatus(p), p.Protocol))
 }
 
 func (d *DB) UpdateProxy(p *Proxy) (*Proxy, error) {
@@ -496,6 +500,13 @@ func (d *DB) UpdateProxyWithOptions(p *Proxy, opts ProxyUpdateOptions) (*Proxy, 
 		if inUse {
 			return ErrProxyInUse
 		}
+		pending, err := warpCreatePendingTx(tx, p.ID)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return ErrProxyInUse
+		}
 		globalID, err := globalProxyIDTx(tx)
 		if err != nil {
 			return err
@@ -561,6 +572,13 @@ func (d *DB) DeleteProxyWithCleanup(id int64, cleanup func(*Proxy) error) error 
 		if channelReferenced {
 			return ErrProxyInUse
 		}
+		pending, err := warpCreatePendingTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return ErrProxyInUse
+		}
 		if cleanup != nil {
 			p, err := getProxyTx(tx, id)
 			if err != nil {
@@ -569,6 +587,9 @@ func (d *DB) DeleteProxyWithCleanup(id int64, cleanup func(*Proxy) error) error 
 			if err = cleanup(p); err != nil {
 				return err
 			}
+		}
+		if _, err := tx.Exec(`UPDATE warp_proxy_create_requests SET state='deleted',proxy_id=NULL,updated_at=now() WHERE proxy_id=$1`, id); err != nil {
+			return err
 		}
 		result, err := tx.Exec(`DELETE FROM outbound_proxies WHERE id=$1`, id)
 		if err != nil {
@@ -587,7 +608,14 @@ func (d *DB) DeleteProxyWithCleanup(id int64, cleanup func(*Proxy) error) error 
 
 func (d *DB) SetProxyStatus(id int64, status, lastError string, checkedAt time.Time) error {
 	return d.withProxyLifecycle(func(tx *sql.Tx) error {
-		_, err := tx.Exec(`UPDATE outbound_proxies SET status=$2,last_error=$3,last_checked_at=$4 WHERE id=$1`, id, status, lastError, checkedAt)
+		pending, err := warpCreatePendingTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return ErrProxyInUse
+		}
+		_, err = tx.Exec(`UPDATE outbound_proxies SET status=$2,last_error=$3,last_checked_at=$4 WHERE id=$1`, id, status, lastError, checkedAt)
 		return err
 	})
 }

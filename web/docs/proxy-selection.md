@@ -1,6 +1,6 @@
 # 代理中心与渠道代理前端合同
 
-适用于本次 `feat/task-proxy-center` 前端，基线 `913d7ad`。本轮只修改 `web/**`，未提交、推送或部署。
+适用于 `feat/task-proxy-center` 前端；本次 WARP 幂等补丁基线 `b0ec701`。只修改 `web/**`，提交与部署由主脑统一处理。
 
 ## 一次确认新增 WARP
 
@@ -10,13 +10,18 @@
 {"name":"出口名称","kind":"warp","accept_terms":true}
 ```
 
-提交期间禁用名称、类型和按钮，同步锁阻止重复点击。成功必须同时满足启用、`warp_phase:ready`、`status:healthy` 和非空 `egress_ip`。
+首次确认后，在发送前把规范化名称、`kind:warp`、明确的 `accept_terms:true` 和 UUID 一起写入 sessionStorage 并读回确认，不保存任何凭据。请求头 `Idempotency-Key` 使用该 UUID，API 客户端不生成 key。渲染、同一事件循环双击、网络重发和手动重试都使用同一 key 与载荷。普通代理不要求此头。
 
-- 502 错误包的 `proxy_id` 与 `proxy.id` 一致时保留该 ID、表单和失败状态，不重新创建。
-- 网络断开、超时或没有可识别 ID 的服务端失败提示结果待确认，并禁用原提交；先刷新目录核对，再编辑已建条目。
+提交期间禁用名称、类型和按钮，同步锁阻止重复点击。成功必须同时满足启用、`warp_phase:ready`、`status:healthy` 和非空 `egress_ip`；成功后进入“已完成添加”，保留原意图，只有明确“新增另一个”才开启新意图。
+
+- 202 或 502 的 `operation_status:pending` 优先于 DTO 的 phase：保留 key，不显示完成或提供 recover。用同 key 重放查询操作结果，每 2 秒最多 30 次；断网/超时后暂停，可手动继续。GET byID 只有运行 DTO，不能据此宣称创建操作已持久化完成。
+- 502 failed 包的 `proxy_id` 与 `proxy.id` 一致时保留该 ID、表单和失败状态；恢复只操作原条目。
+- 网络断开或未知结果保留原 key，用户可点击“使用原请求重试（同意条款）”。刷新只恢复意图，不发请求、不暗中接受条款；明确点击后才重放。名称锁定，不能换 payload。
+- sessionStorage getter/读取/写入/校验异常时阻止新建，不能悄悄退回内存并生成新 key。只写入成功且读回一致才发首个请求。
+- 409 异载荷与 410 tombstone 均保留原 key 并提示核对，不自动重新创建。201 重放若返回非 ready 当前 DTO，只保留现状，不自动注册。异步响应应用前检查所属 key，旧意图响应不能覆盖新意图。
 - 只有旧的 `unregistered` 条目提供明确同意的手动注册修复。`registering`、`starting` 或未知 phase 不提供注册；`failed` 只提供原 ID 的恢复。
 - 已停止/失败的条目隐藏旧 IP，出口验证成功才显示已连接。
-- 前端不自动重 POST，但不能替代服务端幂等。浏览器或代理在响应完全丢失时可能重发请求；本轮没有新增服务端持久幂等机制。
+- 前端稳定 key 与后端持久幂等共同防重；线上两条记录与两次 POST 只能证明重复请求，不能据此断言是浏览器重发或 UI 再次提交。上轮本地 socket destroy 是独立的故障注入复现场景。
 
 ## 渠道代理选择
 
@@ -40,7 +45,7 @@
 在 `web` 目录执行：
 
 ```powershell
-node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/llm-proxy-api.test.mjs src/lib/proxy-center.test.mjs src/lib/proxy-warp-register.test.mjs src/lib/llm-models.test.mjs src/lib/llm-selection.test.mjs
+node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/warp-create-intent.test.mjs src/lib/warp-create-api.test.mjs src/lib/llm-proxy-api.test.mjs src/lib/proxy-center.test.mjs src/lib/proxy-warp-register.test.mjs src/lib/llm-models.test.mjs src/lib/llm-selection.test.mjs
 npx tsc --noEmit --incremental false
 $env:NEXT_EXPORT='1'
 $env:NEXT_PUBLIC_MOCK='0'

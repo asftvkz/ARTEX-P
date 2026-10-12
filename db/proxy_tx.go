@@ -134,6 +134,14 @@ func (d *DB) WithIdleProxy(id int64, fn func(*Proxy) error) (*Proxy, error) {
 		if err != nil {
 			return err
 		}
+		// 创建意图与生命周期准入共用当前事务，不在回调中二次借连接。
+		pending, err := warpCreatePendingTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return ErrProxyInUse
+		}
 		used, err := proxyInUseTx(tx, id)
 		if err != nil {
 			return err
