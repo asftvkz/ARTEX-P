@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 
@@ -8,16 +9,30 @@ import (
 )
 
 type taskLLMResolution struct {
-	ProfileID *int64 `json:"profile_id,omitempty"`
-	Name      string `json:"name"`
-	Format    string `json:"format"`
-	Model     string `json:"model"`
-	Source    string `json:"source"`
-	Available bool   `json:"available"`
-	Reason    string `json:"reason,omitempty"`
+	ModelMode       string  `json:"model_mode"`
+	ModelID         *string `json:"model_id"`
+	UpstreamModelID string  `json:"upstream_model_id"`
+	DisplayName     string  `json:"display_name"`
+	MemberKey       string  `json:"member_key"`
+	ProfileID       *int64  `json:"profile_id,omitempty"`
+	Name            string  `json:"name"`
+	Format          string  `json:"format"`
+	Model           string  `json:"model"`
+	Source          string  `json:"source"`
+	Available       bool    `json:"available"`
+	Reason          string  `json:"reason,omitempty"`
 }
 
 func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMResolution {
+	return s.resolutionFromSelection(p, db.LLMModelSelection{ProfileID: func() int64 {
+		if p == nil {
+			return 0
+		}
+		return p.ID
+	}()}, source)
+}
+
+func (s *Server) resolutionFromSelection(p *db.LLMProfile, selection db.LLMModelSelection, source string, tasks ...*Task) taskLLMResolution {
 	if p == nil {
 		return taskLLMResolution{Source: source, Reason: "LLM 配置不存在"}
 	}
@@ -33,8 +48,36 @@ func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMR
 		result.Reason = "LLM 配置未设置 API Key"
 		return result
 	}
-	if _, _, ok := s.providerForProfile(p.ID); !ok {
+	model, err := s.m.pg.ResolveLLMModel(context.Background(), selection)
+	if err != nil {
+		result.Reason = "模型成员不存在或已禁用"
+		return result
+	}
+	result.ModelMode = selection.Normalized().ModelMode
+	result.ModelID = optionalIDString(&model.ID)
+	result.Model = model.UpstreamModelID
+	result.UpstreamModelID = model.UpstreamModelID
+	result.DisplayName = model.DisplayName
+	result.MemberKey = model.MemberKey()
+	cfg, _, ok := s.loadSelectionConfig(selection)
+	if !ok {
 		result.Reason = "LLM 配置格式或参数无效"
+		return result
+	}
+	if task := firstTask(tasks); task != nil {
+		if task.ProxyMode == db.TaskProxyModeDirect {
+			cfg.Proxy = ""
+		} else if task.ProxyMode == db.TaskProxyModeFixed || cfg.Proxy == "" {
+			snapshot, err := s.m.runtimeSnapshot(task)
+			if err != nil {
+				result.Reason = "任务代理不可用"
+				return result
+			}
+			cfg.Proxy = snapshotProxyURL(snapshot, task.ID)
+		}
+	}
+	if _, err := cfg.NewProvider(); err != nil {
+		result.Reason = "LLM 配置格式或代理参数无效"
 		return result
 	}
 	result.Available = true
@@ -57,12 +100,7 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 		if err != nil {
 			return taskLLMResolution{}, fmt.Errorf("load agent LLM profile: %w", err)
 		}
-		if p != nil {
-			resolved := s.resolutionFromProfile(p, "agent_binding")
-			if resolved.Available {
-				return resolved, nil
-			}
-		}
+		return s.resolutionFromSelection(p, db.LLMModelSelection{ProfileID: *a.LLMProfileID, ModelMode: a.LLMModelMode, ModelID: a.LLMModelID}, "agent_binding", t), nil
 	}
 	state := t.llmStateSnapshot()
 	if len(state.ProfileIDs) > 0 {
@@ -73,17 +111,22 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 		if err != nil {
 			return taskLLMResolution{}, fmt.Errorf("load task LLM profile: %w", err)
 		}
-		return s.resolutionFromProfile(p, "task_chain"), nil
+		selection := db.LLMModelSelection{ProfileID: *state.ActiveID}
+		if state.ActivePosition != nil && *state.ActivePosition < len(state.Members) {
+			selection = state.Members[*state.ActivePosition]
+		}
+		return s.resolutionFromSelection(p, selection, "task_chain", t), nil
 	}
 	p, err := s.m.pg.ActiveProfile()
 	if err != nil {
 		return taskLLMResolution{}, fmt.Errorf("load global LLM profile: %w", err)
 	}
 	if p != nil {
-		resolved := s.resolutionFromProfile(p, "global_profile")
-		if resolved.Available {
-			return resolved, nil
+		selection := db.LLMModelSelection{ProfileID: p.ID}
+		if s.m.LLMPoolEnabled() {
+			selection = s.poolModelSelection(p.ID)
 		}
+		return s.resolutionFromSelection(p, selection, "global_profile", t), nil
 	}
 	s.cfgMu.Lock()
 	on, name, cfg := s.llmOn, s.llmProf, s.llmCfg

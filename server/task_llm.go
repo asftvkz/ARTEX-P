@@ -14,12 +14,15 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
 
 type taskAgentBundle struct {
+	proxyAddr      string
+	proxyCA        string
 	runtime        *taskLLMRuntime // goal decomposition runtime
 	plannerRuntime *taskLLMRuntime
 	workerRuntime  *taskLLMRuntime
@@ -30,10 +33,14 @@ type taskAgentBundle struct {
 }
 
 type llmAuditProfile struct {
-	ID     int64  `json:"id"`
-	Name   string `json:"name"`
-	Format string `json:"format"`
-	Model  string `json:"model"`
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	Format          string `json:"format"`
+	Model           string `json:"model"`
+	ModelID         string `json:"model_id,omitempty"`
+	UpstreamModelID string `json:"upstream_model_id,omitempty"`
+	MemberKey       string `json:"member_key,omitempty"`
+	DisplayName     string `json:"display_name,omitempty"`
 }
 
 type llmTransitionAudit struct {
@@ -88,11 +95,14 @@ func isQuotaExhaustedError(err error) bool {
 type taskLLMSelection struct {
 	task      *Task
 	profileID int64
+	modelID   int64
+	position  int
 	revision  int64
 	provider  llm.Provider
 	// retry 是这次选中的配置解析出来的重试参数(profile 覆盖 → 全局策略 → 内置默认)。
 	// 同 provider 安全窗口重试按它走,所以换了 profile 就换一套重试节奏。
 	retry agent.RetryConfig
+	cfg   agent.Config
 }
 
 type taskLLMStreamHooks struct {
@@ -103,11 +113,11 @@ type taskLLMStreamHooks struct {
 
 // current resolves the provider this role runs on, by precedence:
 // Agent 绑定 → 任务 LLM 配置链 → 全局/环境配置。
-// 绑定优先于任务链：某个角色被显式指定了模型，就一直跑在那个模型上；绑定不存在或
-// 构建失败时才降级到任务链，任务链为空时再降级到全局配置。
+// 显式绑定解析失败时停止，不静默借用任务链；未绑定时读任务链，空链才继承全局。
 // 返回的 profile id 只有走任务链时才非零 —— streamTaskLLM 以此判断额度错误是否
 // 应该推进任务的故障转移状态（绑定/全局路径不改任务链状态，沿用既有语义）。
-func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
+func (r *taskLLMRuntime) current(contexts ...context.Context) (taskLLMSelection, error) {
+	ctx := firstContext(contexts)
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
 		return taskLLMSelection{}, err
@@ -122,28 +132,97 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	r.s.syncTaskLLMState(pt)
 	t, _ := r.s.m.Task(r.taskID)
 	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision}
-	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
-		sel.provider, sel.retry = prov, cfg.Retry
+	if prov, cfg, ok := r.s.agentBindingProviderContext(ctx, r.agentKey, t); ok {
+		sel.provider, sel.retry, sel.cfg = prov, cfg.Retry, cfg
 		return sel, nil
+	}
+	if r.s.agentModelSelection(r.agentKey) != nil {
+		return sel, db.ErrLLMModelUnavailable
 	}
 	if len(pt.LLMProfileIDs) > 0 {
 		if pt.ActiveLLMProfileID == nil {
 			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
-		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
+		selection := db.LLMModelSelection{ProfileID: sel.profileID}
+		if pt.ActiveLLMPosition != nil && *pt.ActiveLLMPosition < len(pt.LLMMembers) {
+			sel.position = *pt.ActiveLLMPosition
+			selection = pt.LLMMembers[sel.position]
+		}
+		model, resolveErr := r.s.m.pg.ResolveLLMModel(context.Background(), selection)
+		if resolveErr != nil {
+			return sel, resolveErr
+		}
+		sel.modelID = model.ID
+		prov, cfg, ok := r.s.providerForTaskSelection(db.LLMModelSelection{ProfileID: selection.ProfileID, ModelMode: db.LLMModelModeFixed, ModelID: &model.ID}, t, ctx)
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
-		sel.provider, sel.retry = prov, cfg.Retry
+		sel.provider, sel.retry, sel.cfg = prov, cfg.Retry, cfg
 		return sel, nil
 	}
-	prov, cfg, ok := r.s.globalProvider()
+	prov, cfg, ok := r.s.globalProviderContext(ctx, t)
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
-	sel.provider, sel.retry = prov, cfg.Retry
+	sel.provider, sel.retry, sel.cfg = prov, cfg.Retry, cfg
 	return sel, nil
+}
+
+func (s *Server) applyTaskLLMProxy(ctx context.Context, t *Task, prov llm.Provider, cfg agent.Config, profileIDs ...int64) (llm.Provider, agent.Config, error) {
+	if t == nil {
+		return prov, cfg, nil
+	}
+	if pool, ok := prov.(*llmpool.Pool); ok {
+		members := make([]*llmpool.Member, 0, len(pool.Members()))
+		for _, member := range pool.Members() {
+			mcfg, _, ok := s.loadSelectionConfig(db.LLMModelSelection{ProfileID: member.ID, ModelMode: db.LLMModelModeFixed, ModelID: &member.ModelID})
+			if !ok {
+				return nil, cfg, db.ErrLLMModelUnavailable
+			}
+			next, _, err := s.applyTaskLLMProxy(ctx, t, member.Prov, mcfg, member.ID)
+			if err != nil {
+				return nil, cfg, err
+			}
+			copy := *member
+			copy.Prov = next
+			members = append(members, &copy)
+		}
+		return llmpool.New(members, s.llmHealth), cfg, nil
+	}
+	channelProxy := ""
+	channelMode := ""
+	var channelProxyID *int64
+	if len(profileIDs) > 0 && profileIDs[0] > 0 {
+		p, err := s.m.pg.ProfileByID(profileIDs[0])
+		if err != nil {
+			return nil, cfg, err
+		}
+		if p != nil {
+			channelProxy, channelMode, channelProxyID = p.Proxy, p.ProxyMode, p.ProxyID
+		}
+	} else {
+		channelProxy = cfg.Proxy
+	}
+	override, err := s.m.ResolveLLMProxySelection(ctx, t, channelProxy, channelMode, channelProxyID)
+	if err != nil {
+		return nil, cfg, err
+	}
+	if cfg.Proxy == override {
+		return prov, cfg, nil
+	}
+	cfg.Proxy = override
+	next, err := cfg.NewProvider()
+	if err != nil {
+		return nil, cfg, fmt.Errorf("build task LLM proxy: %w", err)
+	}
+	if s.m != nil && s.m.pg != nil && len(profileIDs) > 0 && profileIDs[0] > 0 {
+		if p, _ := s.m.pg.ProfileByID(profileIDs[0]); p != nil {
+			next = llmrec.Wrap(next, s.m.pg, cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+			next = bindSideProvider(next, cfg, p.ID, p.Name)
+		}
+	}
+	return next, cfg, nil
 }
 
 // activeCfg resolves the task's currently-active LLM config, mirroring current()'s
@@ -160,15 +239,31 @@ func (r *taskLLMRuntime) activeCfg() (agent.Config, bool) {
 	if err != nil || pt == nil {
 		return agent.Config{}, false
 	}
-	if _, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
-		return cfg, true
+	if selection := r.s.agentModelSelection(r.agentKey); selection != nil {
+		cfg, _, ok := r.s.loadSelectionConfig(*selection)
+		return cfg, ok
 	}
 	if len(pt.LLMProfileIDs) > 0 && pt.ActiveLLMProfileID != nil {
-		if _, cfg, ok := r.s.providerForProfile(*pt.ActiveLLMProfileID); ok {
+		selection := db.LLMModelSelection{ProfileID: *pt.ActiveLLMProfileID}
+		if pt.ActiveLLMPosition != nil && *pt.ActiveLLMPosition < len(pt.LLMMembers) {
+			selection = pt.LLMMembers[*pt.ActiveLLMPosition]
+		}
+		if cfg, _, ok := r.s.loadSelectionConfig(selection); ok {
 			return cfg, true
 		}
 	}
-	if _, cfg, ok := r.s.globalProvider(); ok {
+	if p, _ := r.s.m.pg.ActiveProfile(); p != nil {
+		selection := db.LLMModelSelection{ProfileID: p.ID}
+		if r.s.m.LLMPoolEnabled() {
+			selection = r.s.poolModelSelection(p.ID)
+		}
+		cfg, _, ok := r.s.loadSelectionConfig(selection)
+		return cfg, ok
+	}
+	r.s.cfgMu.Lock()
+	cfg, on := r.s.llmCfg, r.s.llmOn
+	r.s.cfgMu.Unlock()
+	if on {
 		return cfg, true
 	}
 	return agent.Config{}, false
@@ -199,12 +294,12 @@ func parseTaskID(id string) (int64, error) {
 // streamHooks builds the failover/exhaustion callbacks shared by Stream and
 // Complete: how to read the current profile selection, how to mark it quota
 // exhausted, and how to emit a failover transition.
-func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
+func (r *taskLLMRuntime) streamHooks(contexts ...context.Context) taskLLMStreamHooks {
 	return taskLLMStreamHooks{
-		current: r.current,
+		current: func() (taskLLMSelection, error) { return r.current(contexts...) },
 		exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
 			taskNum, _ := parseTaskID(r.taskID)
-			transition, err := r.s.m.pg.MarkTaskLLMProfileQuotaExhaustedAtRevision(taskNum, selection.profileID, selection.revision, cause.Error())
+			transition, err := r.s.m.pg.MarkTaskLLMModelQuotaExhausted(taskNum, selection.position, selection.modelID, selection.revision, cause.Error())
 			if err != nil {
 				return transition, err
 			}
@@ -220,8 +315,16 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 }
 
 func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
-	ctx = llmrec.WithTaskID(ctx, r.taskID)
-	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	return func(yield func(llm.StreamEvent, error) bool) {
+		callCtx, finish, ok := r.admitCall(ctx)
+		if !ok {
+			yield(llm.StreamEvent{}, db.ErrProxyInUse)
+			return
+		}
+		defer finish()
+		callCtx = llmrec.WithTaskID(callCtx, r.taskID)
+		streamTaskLLM(callCtx, r.taskID, req, r.streamHooks(callCtx))(yield)
+	}
 }
 
 // Complete is the non-streaming counterpart of Stream. A non-streaming call is
@@ -230,8 +333,20 @@ func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) 
 // duplicated model output or tool execution (the "committed" bookkeeping the
 // streaming path needs is unnecessary here).
 func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	ctx, finish, ok := r.admitCall(ctx)
+	if !ok {
+		return llm.Message{}, "", llm.Usage{}, db.ErrProxyInUse
+	}
+	defer finish()
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
-	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks(ctx))
+}
+
+func (r *taskLLMRuntime) admitCall(ctx context.Context) (context.Context, func(), bool) {
+	if r.s.m.TaskProxyOperationAdmitted(ctx, r.taskID) {
+		return ctx, func() {}, true
+	}
+	return r.s.engine.beginTaskOperationContext(ctx, r.taskID)
 }
 
 func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) (llm.Message, string, llm.Usage, error) {
@@ -454,8 +569,11 @@ func isRetryableStreamError(err error) bool {
 // CompactionWindow mirrors current()'s precedence so the context window always
 // matches the provider the role will actually stream on.
 func (r *taskLLMRuntime) CompactionWindow() int {
-	if _, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
-		return cfg.CompactionWindow()
+	if selection := r.s.agentModelSelection(r.agentKey); selection != nil {
+		if cfg, _, ok := r.s.loadSelectionConfig(*selection); ok {
+			return cfg.CompactionWindow()
+		}
+		return (agent.Config{}).CompactionWindow()
 	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -466,14 +584,14 @@ func (r *taskLLMRuntime) CompactionWindow() int {
 		return (agent.Config{}).CompactionWindow()
 	}
 	if len(chain) == 0 {
-		if _, cfg, ok := r.s.globalProvider(); ok {
+		if cfg, ok := r.activeCfg(); ok {
 			return cfg.CompactionWindow()
 		}
 		return (agent.Config{}).CompactionWindow()
 	}
 	minimum := 0
 	for _, entry := range chain {
-		if cfg, ok := r.s.loadProfileConfig(entry.ProfileID); ok {
+		if cfg, _, ok := r.s.loadSelectionConfig(db.LLMModelSelection{ProfileID: entry.ProfileID, ModelMode: entry.ModelMode, ModelID: entry.ModelID}); ok {
 			window := cfg.CompactionWindow()
 			if minimum == 0 || window < minimum {
 				minimum = window
@@ -491,28 +609,82 @@ func (r *taskLLMRuntime) CompactionWindow() int {
 // when the role has no binding or the bound profile no longer builds, so callers
 // fall through to the task chain. A bound profile stays exclusive unless
 // llm_pool_bind_fallback is on, which is what poolForBinding encodes.
-func (s *Server) agentBindingProvider(agentKey string) (llm.Provider, agent.Config, bool) {
-	id := s.effectiveProfileForAgent(agentKey, nil)
-	if id == nil {
+func (s *Server) agentBindingProvider(agentKey string, tasks ...*Task) (llm.Provider, agent.Config, bool) {
+	return s.agentBindingProviderContext(context.Background(), agentKey, firstTask(tasks))
+}
+
+func (s *Server) agentBindingProviderContext(ctx context.Context, agentKey string, task *Task) (llm.Provider, agent.Config, bool) {
+	selection := s.agentModelSelection(agentKey)
+	if selection == nil {
 		return nil, agent.Config{}, false
 	}
-	prov, cfg, ok := s.providerForProfile(*id)
+	prov, cfg, ok := s.providerForTaskSelection(*selection, task, ctx)
 	if !ok {
 		return nil, agent.Config{}, false
 	}
-	return s.poolForBinding(*id, prov, cfg), cfg, true
+	if s.m.LLMPoolEnabled() && s.m.LLMPoolBindFallback() {
+		if pool := s.poolChainContext(ctx, selection.ProfileID, prov, cfg, false, task); pool != nil {
+			prov = pool
+		}
+	}
+	return prov, cfg, true
+}
+
+func (s *Server) agentModelSelection(key string) *db.LLMModelSelection {
+	if s.m != nil && s.m.pg != nil {
+		if a, _ := s.m.pg.GetAgentByKey(key); a != nil && a.LLMProfileID != nil {
+			return &db.LLMModelSelection{ProfileID: *a.LLMProfileID, ModelMode: a.LLMModelMode, ModelID: a.LLMModelID}
+		}
+	}
+	return nil
 }
 
 // globalProvider returns the process-wide provider (persisted active profile or
 // environment config) — the last resort once a role has neither a binding nor a
 // task chain.
-func (s *Server) globalProvider() (llm.Provider, agent.Config, bool) {
+func (s *Server) globalProvider(tasks ...*Task) (llm.Provider, agent.Config, bool) {
+	return s.globalProviderContext(context.Background(), firstTask(tasks))
+}
+
+func (s *Server) globalProviderContext(ctx context.Context, task *Task) (llm.Provider, agent.Config, bool) {
+	if s.m != nil && s.m.pg != nil {
+		if p, _ := s.m.pg.ActiveProfile(); p != nil {
+			selection := db.LLMModelSelection{ProfileID: p.ID}
+			if s.m.LLMPoolEnabled() {
+				selection = s.poolModelSelection(p.ID)
+			}
+			prov, cfg, ok := s.providerForTaskSelection(selection, task, ctx)
+			if !ok {
+				return nil, cfg, false
+			}
+			if pool := s.poolChainContext(ctx, p.ID, prov, cfg, true, task); pool != nil {
+				prov = pool
+			}
+			return prov, cfg, true
+		}
+	}
 	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
 	if !s.llmOn || s.llmProv == nil {
+		s.cfgMu.Unlock()
 		return nil, agent.Config{}, false
 	}
-	return s.llmProv, s.llmCfg, true
+	prov, cfg := s.llmProv, s.llmCfg
+	s.cfgMu.Unlock()
+	if task != nil {
+		var err error
+		prov, cfg, err = s.applyTaskLLMProxy(ctx, task, prov, cfg)
+		if err != nil {
+			return nil, cfg, false
+		}
+	}
+	return prov, cfg, true
+}
+
+func firstTask(tasks []*Task) *Task {
+	if len(tasks) > 0 {
+		return tasks[0]
+	}
+	return nil
 }
 
 // taskRuntimeAvailable reports whether every listed role can resolve a provider
@@ -527,13 +699,34 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 	unboundReady := false
 	if len(state.ProfileIDs) > 0 {
 		if state.ActiveID != nil {
-			_, _, unboundReady = s.providerForProfile(*state.ActiveID)
+			selection := db.LLMModelSelection{ProfileID: *state.ActiveID}
+			if state.ActivePosition != nil && *state.ActivePosition < len(state.Members) {
+				selection = state.Members[*state.ActivePosition]
+			}
+			_, _, unboundReady = s.loadSelectionConfig(selection)
 		}
 	} else {
-		_, _, unboundReady = s.globalProvider()
+		var p *db.LLMProfile
+		if s.m.pg != nil {
+			p, _ = s.m.pg.ActiveProfile()
+		}
+		if p != nil {
+			selection := db.LLMModelSelection{ProfileID: p.ID}
+			if s.m.LLMPoolEnabled() {
+				selection = s.poolModelSelection(p.ID)
+			}
+			_, _, unboundReady = s.loadSelectionConfig(selection)
+		} else {
+			s.cfgMu.Lock()
+			unboundReady = s.llmOn && s.llmProv != nil
+			s.cfgMu.Unlock()
+		}
 	}
 	for _, key := range agentKeys {
-		if _, _, ok := s.agentBindingProvider(key); ok {
+		if selection := s.agentModelSelection(key); selection != nil {
+			if _, _, ok := s.loadSelectionConfig(*selection); !ok {
+				return false
+			}
 			continue
 		}
 		if !unboundReady {
@@ -549,11 +742,19 @@ func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Unlock()
 }
 
-func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
+func (s *Server) agentsForTask(t *Task, contexts ...context.Context) (*taskAgentBundle, error) {
+	ctx := firstContext(contexts)
+	proxyAddr, proxyCA, err := s.m.TaskToolProxy(ctx, t)
+	if err != nil {
+		return nil, fmt.Errorf("任务工具代理解析失败: %w", err)
+	}
 	s.taskAgentMu.Lock()
 	defer s.taskAgentMu.Unlock()
-	if bundle := s.taskAgents[t.ID]; bundle != nil {
-		return bundle
+	if s.taskAgents == nil {
+		s.taskAgents = map[string]*taskAgentBundle{}
+	}
+	if bundle := s.taskAgents[t.ID]; bundle != nil && bundle.proxyAddr == proxyAddr && bundle.proxyCA == proxyCA {
+		return bundle, nil
 	}
 	goalRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "goals"}
 	plannerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "planner"}
@@ -568,7 +769,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
-	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	wk.SetProxy(proxyAddr, proxyCA)
+	wk.SetStrictProxy(true)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
@@ -579,7 +781,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
-	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	pl.SetProxy(proxyAddr, proxyCA)
+	pl.SetStrictProxy(true)
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
@@ -592,15 +795,24 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetNonStreaming(mainRuntime.nonStreaming)
 	main.SetMaxTokens(mainRuntime.maxTokens)
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	main.SetProxy(proxyAddr, proxyCA)
+	main.SetStrictProxy(true)
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{
+		proxyAddr: proxyAddr, proxyCA: proxyCA,
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
 	}
 	s.taskAgents[t.ID] = bundle
-	return bundle
+	return bundle, nil
+}
+
+func firstContext(contexts []context.Context) context.Context {
+	if len(contexts) > 0 && contexts[0] != nil {
+		return contexts[0]
+	}
+	return context.Background()
 }
 
 func (s *Server) syncTaskLLMState(pt *db.Task) {
@@ -610,7 +822,7 @@ func (s *Server) syncTaskLLMState(pt *db.Task) {
 	id := fmt.Sprintf("%d", pt.ID)
 	s.m.mu.Lock()
 	if task := s.m.tasks[id]; task != nil {
-		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
+		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason, pt)
 	}
 	s.m.mu.Unlock()
 }
@@ -619,10 +831,15 @@ func (s *Server) emitTaskLLMTransition(t *Task, transition db.TaskLLMTransition,
 	if t == nil {
 		return
 	}
-	previous := s.llmAuditProfile(transition.PreviousProfileID)
+	previous := s.llmAuditModel(transition.PreviousProfileID, transition.PreviousModelID)
 	var next *llmAuditProfile
 	if transition.NextProfileID != nil {
-		next = s.llmAuditProfile(*transition.NextProfileID)
+		state := t.llmStateSnapshot()
+		if actual := t.activeLLMMember(state); actual != nil {
+			next = s.llmAuditModel(*transition.NextProfileID, func() int64 { id, _ := strconv.ParseInt(actual.ModelID, 10, 64); return id }())
+		} else {
+			next = s.llmAuditProfile(*transition.NextProfileID)
+		}
 	}
 	mode := "automatic"
 	kind := "llm_switch"
@@ -645,11 +862,37 @@ func (s *Server) llmAuditProfile(id int64) *llmAuditProfile {
 	if id <= 0 || s.m == nil || s.m.pg == nil {
 		return nil
 	}
+	model, err := s.m.pg.ResolveLLMModel(context.Background(), db.LLMModelSelection{ProfileID: id})
+	if err == nil {
+		return s.llmAuditModel(id, model.ID)
+	}
+	return s.llmAuditModel(id, 0)
+}
+
+func (s *Server) llmAuditModel(id, modelID int64) *llmAuditProfile {
+	if id <= 0 || s.m == nil || s.m.pg == nil {
+		return nil
+	}
 	p, err := s.m.pg.ProfileByID(id)
 	if err != nil || p == nil {
 		return &llmAuditProfile{ID: id, Name: fmt.Sprintf("配置 #%d", id)}
 	}
-	return &llmAuditProfile{ID: p.ID, Name: p.Name, Format: p.Format, Model: p.Model}
+	out := &llmAuditProfile{ID: p.ID, Name: p.Name, Format: p.Format, Model: p.Model}
+	if modelID > 0 {
+		if set, err := s.m.pg.ListLLMModels(id); err == nil {
+			for _, model := range set.Models {
+				if model.ID == modelID {
+					out.Model = model.UpstreamModelID
+					out.ModelID = i64s(model.ID)
+					out.UpstreamModelID = model.UpstreamModelID
+					out.DisplayName = model.DisplayName
+					out.MemberKey = model.MemberKey()
+					break
+				}
+			}
+		}
+	}
+	return out
 }
 
 func llmAuditProfileLabel(profile *llmAuditProfile) string {
@@ -680,7 +923,29 @@ func sameOptionalID(a, b *int64) bool {
 	return *a == *b
 }
 
-func (s *Server) emitManualTaskLLMSwitch(t *Task, previousID, nextID *int64) db.Activity {
+func sameResolvedMember(a, b *LLMResolvedMemberDTO) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.MemberKey == b.MemberKey && a.ModelMode == b.ModelMode
+}
+
+func auditResolvedMember(actual *LLMResolvedMemberDTO, base *llmAuditProfile) *llmAuditProfile {
+	if actual == nil {
+		return base
+	}
+	if base == nil {
+		base = &llmAuditProfile{}
+	}
+	base.ModelID = actual.ModelID
+	base.Model = actual.UpstreamModelID
+	base.UpstreamModelID = actual.UpstreamModelID
+	base.DisplayName = actual.DisplayName
+	base.MemberKey = actual.MemberKey
+	return base
+}
+
+func (s *Server) emitManualTaskLLMSwitch(t *Task, previousID, nextID *int64, actual ...*LLMResolvedMemberDTO) db.Activity {
 	previous := (*llmAuditProfile)(nil)
 	next := (*llmAuditProfile)(nil)
 	if previousID != nil {
@@ -688,6 +953,10 @@ func (s *Server) emitManualTaskLLMSwitch(t *Task, previousID, nextID *int64) db.
 	}
 	if nextID != nil {
 		next = s.llmAuditProfile(*nextID)
+	}
+	if len(actual) == 2 {
+		previous = auditResolvedMember(actual[0], previous)
+		next = auditResolvedMember(actual[1], next)
 	}
 	summary := fmt.Sprintf("用户手动将任务 LLM 从 %s 切换到 %s", llmAuditProfileLabel(previous), llmAuditProfileLabel(next))
 	metadata, _ := json.Marshal(llmActivityMetadata{LLMTransition: llmTransitionAudit{

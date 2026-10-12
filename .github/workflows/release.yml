@@ -4,33 +4,53 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write # 创建 Release 需要
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ① 前端静态导出（一次），产物给交叉编译各平台复用
   frontend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: '[[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test update download, verification and rollback
+        run: |
+          timeout 60s go test ./selfupdate -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^TestReleaseCache' -count=1 -timeout 60s
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: npm ci
+      - run: npm ci --ignore-scripts
         working-directory: web
-      - run: npm run build:static
+      - name: Export production frontend
         working-directory: web
+        env:
+          NEXT_EXPORT: "1"
+          NEXT_PUBLIC_MOCK: "0"
+        run: npx next build --webpack
       - uses: actions/upload-artifact@v4
         with:
           name: web-dist
           path: web/out
+          if-no-files-found: error
 
-  # ② 五平台交叉编译（内嵌前端）+ 打 zip
   binaries:
     needs: frontend
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { goos: linux, goarch: amd64 }
@@ -42,26 +62,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
           cache: true
       - uses: actions/download-artifact@v4
         with:
           name: web-dist
           path: server/webui/dist
-      - name: Build and package with build.sh
+      - name: Build and package
         env:
           ARTEX_TARGET_OS: ${{ matrix.goos }}
           ARTEX_TARGET_ARCH: ${{ matrix.goarch }}
           ARTEX_BUILD_VERSION: ${{ github.ref_name }}
           ARTEX_SKIP_FRONTEND: "1"
-          ARTEX_SKIP_NPM_CI: "1"
-          # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
-          # Release 使用 Go linker 裁剪和 zip 压缩，优先保证可移植性。
           ARTEX_COMPRESS: "0"
           ARTEX_PACKAGE: "1"
           ARTEX_PACKAGE_DIR: dist
-        run: |
-          ./build.sh --target "${ARTEX_TARGET_OS}/${ARTEX_TARGET_ARCH}"
+        run: ./build.sh --target "${ARTEX_TARGET_OS}/${ARTEX_TARGET_ARCH}"
       - name: Smoke test Linux amd64 binary
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: dist/artex-linux-amd64/artex -h
@@ -69,67 +85,120 @@ jobs:
         with:
           name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "dist/*.zip"
-      # Linux 生二进制单独上传，供 docker job 复用（免在镜像里重编前端+Go）
+          if-no-files-found: error
       - if: matrix.goos == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: bin-linux-${{ matrix.goarch }}
           path: dist/artex-linux-${{ matrix.goarch }}/artex
+          if-no-files-found: error
 
-  # ③ 汇总所有 zip → 创建 GitHub Release
-  release:
+  # 原生架构构建运行工具层，避免通过 QEMU 安装 Chromium。
+  docker:
     needs: binaries
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve package name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}
+      - run: chmod +x dist/${{ matrix.arch }}/artex
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            BINARY_STAGE=prebuilt
+            NPM_REGISTRY=https://registry.npmjs.org
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  docker-merge:
+    needs: docker
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish and inspect multi-platform tags
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          cd digests
+          docker buildx imagetools create -t "$IMAGE:$RELEASE_TAG" -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG"
+
+  # 完整镜像发布成功后才公开 Release，避免更新到缺少镜像的版本。
+  release:
+    needs: [binaries, docker-merge]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: pkg-*
           merge-multiple: true
           path: dist
-      - name: Generate checksums
+      - name: Generate and verify checksums
         working-directory: dist
-        run: sha256sum *.zip > SHA256SUMS
+        run: |
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 5
+          sha256sum *.zip > SHA256SUMS
+          sha256sum -c SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          name: ARTEX ${{ github.ref_name }}
           files: |
             dist/*.zip
             dist/SHA256SUMS
+          fail_on_unmatched_files: true
           generate_release_notes: true
-
-  # ④ 多架构镜像 → 推 Docker Hub（复用 binaries 编好的 Linux 二进制，
-  #    镜像里只装工具 + 放二进制；arm64 仅需模拟 apt 层，构建快很多）
-  docker:
-    needs: binaries
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4 # 取 Dockerfile 与 skills/
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin-linux-amd64
-          path: dist/amd64
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin-linux-arm64
-          path: dist/arm64
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: autumn27/artex
-          tags: |
-            type=ref,event=tag
-            type=raw,value=latest
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          make_latest: true

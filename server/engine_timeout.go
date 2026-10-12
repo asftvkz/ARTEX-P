@@ -48,16 +48,54 @@ func (e *Engine) inflightCounter(taskID string) *int64 {
 // has already installed its barrier. The delete handler can therefore wait for
 // inflight==0 without a check-then-start race recreating files after cleanup.
 func (e *Engine) beginTaskOperation(taskID string) bool {
+	b := e.proxyBarrier(taskID)
+	b.mu.Lock()
+	for b.releasing {
+		changed := b.changed
+		b.mu.Unlock()
+		<-changed
+		b.mu.Lock()
+	}
+	defer b.mu.Unlock()
 	e.deleteMu.RLock()
 	defer e.deleteMu.RUnlock()
 	if e.IsDeleting(taskID) {
 		return false
 	}
+	if e.m != nil && e.m.pg != nil {
+		id, err := strconv.ParseInt(taskID, 10, 64)
+		if err != nil {
+			return false
+		}
+		if err = e.m.pg.AcquireTaskProxyActivity(id); err != nil {
+			log.Printf("[proxy] 任务 %s 操作准入失败: %v", taskID, err)
+			return false
+		}
+	}
 	atomic.AddInt64(e.inflightCounter(taskID), 1)
 	return true
 }
 
-func (e *Engine) decInflight(taskID string) { atomic.AddInt64(e.inflightCounter(taskID), -1) }
+func (e *Engine) decInflight(taskID string) {
+	b := e.proxyBarrier(taskID)
+	b.mu.Lock()
+	if e.m != nil && e.m.pg != nil {
+		id, err := strconv.ParseInt(taskID, 10, 64)
+		if err == nil {
+			if err = e.m.pg.ReleaseTaskProxyActivity(id); err != nil {
+				log.Printf("[proxy] 任务 %s 操作占用解除失败: %v", taskID, err)
+			}
+		}
+	}
+	remaining := atomic.AddInt64(e.inflightCounter(taskID), -1)
+	b.signal()
+	b.mu.Unlock()
+	if remaining == 0 && e.m != nil {
+		if task, ok := e.m.Task(taskID); ok && (e.IsPaused(taskID) || isTerminalStatus(task.lifecycleSnapshot().Status)) {
+			e.requestProxyRelease(taskID, false)
+		}
+	}
+}
 func (e *Engine) inflightCount(taskID string) int64 {
 	return atomic.LoadInt64(e.inflightCounter(taskID))
 }
@@ -230,10 +268,12 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 // task-timeout planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
 func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
-	if e.IsDeleting(t.ID) {
+	opCtx, finish, admitted := e.beginTaskOperationContext(ctx, t.ID)
+	if !admitted {
 		return false
 	}
-	planner, _ := e.snapshotFor(t)
+	defer finish()
+	planner, _ := e.snapshotFor(t, opCtx)
 	for planner == nil {
 		if sleepCtx(ctx, deadlinePollInterval) {
 			return false
@@ -244,14 +284,10 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 		if e.IsDeleting(t.ID) {
 			return false
 		}
-		planner, _ = e.snapshotFor(t)
+		planner, _ = e.snapshotFor(t, opCtx)
 	}
 	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final 注入任务超时词。
-	fctx := e.clockCtx(ctx, t, true)
-	if !e.beginTaskOperation(t.ID) {
-		return false
-	}
-	defer e.decInflight(t.ID)
+	fctx := e.clockCtx(opCtx, t, true)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: fmt.Sprintf("任务超时收尾·终局判定(第 %d 轮)", e.nextPlannerRound(t.ID))})

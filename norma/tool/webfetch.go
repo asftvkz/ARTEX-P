@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,6 +32,9 @@ type WebFetchConfig struct {
 	// InsecureTLS skips TLS certificate verification entirely (equivalent to
 	// curl -k). A blunt fallback when no CA cert is available; prefer CACert.
 	InsecureTLS bool
+	// StrictProxy disables the historical direct retry. Task-selected proxies
+	// must fail closed and never silently escape to a different egress.
+	StrictProxy bool
 }
 
 // NewWebFetch builds the WebFetch tool: fetches a URL over HTTP(S) and returns
@@ -69,13 +73,15 @@ const maxFetchBytes = 2 << 20 // 2 MiB
 
 // newFetchClient returns an HTTP client honoring the proxy / TLS config.
 func newFetchClient(cfg WebFetchConfig) *http.Client {
-	if cfg.Proxy == "" && !cfg.InsecureTLS && cfg.CACert == "" {
+	if cfg.Proxy == "" && !cfg.InsecureTLS && cfg.CACert == "" && !cfg.StrictProxy {
 		return &http.Client{}
 	}
 	tr := &http.Transport{}
 	if cfg.Proxy != "" {
-		if pu, err := url.Parse(cfg.Proxy); err == nil {
+		if pu, err := url.Parse(cfg.Proxy); err == nil && pu.Host != "" && (pu.Scheme == "http" || pu.Scheme == "https" || pu.Scheme == "socks5") {
 			tr.Proxy = http.ProxyURL(pu)
+		} else {
+			tr.Proxy = func(*http.Request) (*url.URL, error) { return nil, errors.New("代理地址无效") }
 		}
 	}
 	switch {
@@ -162,7 +168,7 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 	// it bypasses the configured proxy so a recording/MITM hiccup doesn't fail an
 	// otherwise-reachable URL. nil when no proxy is configured (nothing to bypass).
 	var direct *http.Client
-	if cfg.Proxy != "" {
+	if cfg.Proxy != "" && !cfg.StrictProxy {
 		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS})
 	}
 	return func(ctx context.Context, input json.RawMessage, _ *ToolContext) (Result, error) {

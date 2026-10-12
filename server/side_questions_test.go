@@ -430,7 +430,7 @@ func TestSideRejectsDeletedOrChangedCachedProfile(t *testing.T) {
 	if _, err = f.s.sideProvider(model); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.m.pg.Exec(`UPDATE llm_profiles SET model='changed' WHERE id=$1`, id); err != nil {
+	if _, err = f.m.pg.ReplaceLLMModels(id, []db.LLMModelInput{{UpstreamModelID: "fixture", DisplayName: "fixture", Enabled: true}, {UpstreamModelID: "changed", DisplayName: "changed", Enabled: true, Default: true}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = f.s.sideProvider(model); err == nil {

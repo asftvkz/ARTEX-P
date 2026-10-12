@@ -10,6 +10,8 @@
 package llmpool
 
 import (
+	"fmt"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -42,13 +44,14 @@ const softTripAfter = 3
 // (saving an unrelated profile, toggling a setting) never clears what we've learned
 // about which backends are broken.
 type Registry struct {
-	mu sync.Mutex
-	m  map[int64]*State
+	opMu sync.Mutex
+	mu   sync.Mutex
+	m    map[string]*State
 
 	// persist / forget mirror state to the DB so a cooling-off window survives a
 	// restart. Both may be nil (no DB); both are called off the hot path.
-	persist func(id int64, st State)
-	forget  func(id int64)
+	persist func(id string, st State)
+	forget  func(id string)
 
 	// softTrip / cooldown are the operator-set overrides (0 = use the built-in
 	// default / ladder). They live here rather than being read per failure because
@@ -90,11 +93,25 @@ func (r *Registry) coolFor(trips int) time.Duration {
 
 // NewRegistry builds an empty registry. persist/forget may be nil.
 func NewRegistry(persist func(id int64, st State), forget func(id int64)) *Registry {
-	return &Registry{m: map[int64]*State{}, persist: persist, forget: forget}
+	var p func(string, State)
+	var f func(string)
+	if persist != nil {
+		p = func(key string, st State) { id, _ := strconv.ParseInt(key, 10, 64); persist(id, st) }
+	}
+	if forget != nil {
+		f = func(key string) { id, _ := strconv.ParseInt(key, 10, 64); forget(id) }
+	}
+	return NewMemberRegistry(p, f)
+}
+
+// 成员键由渠道 ID 和实际模型 ID 组成，旧调用的整数身份只用于兼容已有测试和调用方。
+func NewMemberRegistry(persist func(string, State), forget func(string)) *Registry {
+	return &Registry{m: map[string]*State{}, persist: persist, forget: forget}
 }
 
 // Restore seeds state loaded from the DB at startup (bypasses persistence).
-func (r *Registry) Restore(id int64, st State) {
+func (r *Registry) Restore(identity any, st State) {
+	id := fmt.Sprint(identity)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cp := st
@@ -102,7 +119,8 @@ func (r *Registry) Restore(id int64, st State) {
 }
 
 // Get returns a copy of one profile's state.
-func (r *Registry) Get(id int64) State {
+func (r *Registry) Get(identity any) State {
+	id := fmt.Sprint(identity)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if st := r.m[id]; st != nil {
@@ -112,11 +130,14 @@ func (r *Registry) Get(id int64) State {
 }
 
 // IsOpen reports whether a profile is in its cooling-off window.
-func (r *Registry) IsOpen(id int64) bool { return r.Get(id).Open() }
+func (r *Registry) IsOpen(id any) bool { return r.Get(id).Open() }
 
 // Pass records a successful call: clears the failure counters so a profile that
 // recovers is fully trusted again (and drops the persisted row).
-func (r *Registry) Pass(id int64) {
+func (r *Registry) Pass(identity any) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	id := fmt.Sprint(identity)
 	r.mu.Lock()
 	st := r.m[id]
 	if st == nil || (st.Fails == 0 && st.Trips == 0 && st.OpenUntil.IsZero()) {
@@ -135,7 +156,10 @@ func (r *Registry) Pass(id int64) {
 // invalid key, missing model) which opens the breaker immediately; hard=false is a
 // transient one (429 / 5xx / network) that needs softTripAfter in a row. Returns
 // true when this call is what opened the breaker, so the caller can log it once.
-func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
+func (r *Registry) Trip(identity any, errMsg string, hard bool) (tripped bool) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	id := fmt.Sprint(identity)
 	r.mu.Lock()
 	st := r.m[id]
 	if st == nil {
@@ -162,7 +186,10 @@ func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 }
 
 // Reset clears one profile's state — the UI's "立即恢复" action.
-func (r *Registry) Reset(id int64) {
+func (r *Registry) Reset(identity any) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	id := fmt.Sprint(identity)
 	r.mu.Lock()
 	delete(r.m, id)
 	forget := r.forget
@@ -173,10 +200,29 @@ func (r *Registry) Reset(id int64) {
 }
 
 // Snapshot returns a copy of all tracked state, for the status API.
-func (r *Registry) Snapshot() map[int64]State {
+// 批量恢复与 Trip/Pass 共用操作锁，持久化和内存删除不会被迟到写入交错。
+func (r *Registry) ResetMatching(match func(string) bool, forget func() error) error {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	if forget != nil {
+		if err := forget(); err != nil {
+			return err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make(map[int64]State, len(r.m))
+	for key := range r.m {
+		if match(key) {
+			delete(r.m, key)
+		}
+	}
+	return nil
+}
+
+func (r *Registry) Snapshot() map[string]State {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]State, len(r.m))
 	for id, st := range r.m {
 		out[id] = *st
 	}

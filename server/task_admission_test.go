@@ -523,7 +523,8 @@ func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
 	req.SetPathValue("iid", fmt.Sprintf("%d", intentID))
 	rec := httptest.NewRecorder()
 	s.rerunIntent(rec, req)
-	if rec.Code != http.StatusInternalServerError {
+	// 代理活动准入在意图写入前拒绝已删除任务；冲突响应保留原有数据不变断言。
+	if rec.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	node, err := task.Store.GetNode(intentID)

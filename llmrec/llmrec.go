@@ -62,10 +62,11 @@ func workerFrom(ctx context.Context) string {
 
 // Recorder wraps an llm.Provider and records every completion call.
 type Recorder struct {
-	inner llm.Provider
-	pg    *db.DB
-	model string // model name (from config, not in CompletionRequest)
-	prof  string // LLM profile name (from llm_profiles)
+	inner  llm.Provider
+	pg     *db.DB
+	model  string       // model name (from config, not in CompletionRequest)
+	prof   string       // LLM profile name (from llm_profiles)
+	member *db.LLMModel // 调用启动时确定的稳定成员身份，不受随后默认切换影响
 	// thinkingType / reasoningEffort 是配置级思考参数(思考开关 / 思考强度)。它们在
 	// norma 的 buildBody() 里从 provider 配置注入真正的 HTTP body,不出现在
 	// CompletionRequest 上,故 Recorder 需在此单独带一份,序列化时写进录制。
@@ -78,11 +79,16 @@ type Recorder struct {
 // profName is the LLM profile name (e.g. "default"); may be empty. thinkingType /
 // reasoningEffort are the config-level thinking params actually sent to the API
 // (empty = not sent). A nil enabled predicate records unconditionally.
-func Wrap(inner llm.Provider, pg *db.DB, model, profName, thinkingType, reasoningEffort string, enabled func() bool) *Recorder {
-	return &Recorder{
+func Wrap(inner llm.Provider, pg *db.DB, model, profName, thinkingType, reasoningEffort string, enabled func() bool, members ...db.LLMModel) *Recorder {
+	r := &Recorder{
 		inner: inner, pg: pg, model: model, prof: profName,
 		thinkingType: thinkingType, reasoningEffort: reasoningEffort, enabled: enabled,
 	}
+	if len(members) > 0 {
+		member := members[0]
+		r.member = &member
+	}
+	return r
 }
 
 // parseSession extracts task id and worker role from session strings like
@@ -272,7 +278,7 @@ func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage 
 		usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 {
 		return
 	}
-	err := r.pg.InsertLLMUsage(&db.LLMUsage{
+	u := &db.LLMUsage{
 		TaskID:        taskID,
 		ExplorationID: expID,
 		Worker:        worker,
@@ -284,7 +290,14 @@ func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage 
 		CacheRead:     usage.CacheReadTokens,
 		CacheWrite:    usage.CacheWriteTokens,
 		Status:        status,
-	})
+	}
+	if r.member != nil {
+		u.ProfileID = r.member.ProfileID
+		u.ModelID = r.member.ID
+		u.MemberKey = r.member.MemberKey()
+		u.UpstreamModelID = r.member.UpstreamModelID
+	}
+	err := r.pg.InsertLLMUsage(u)
 	if err != nil {
 		log.Printf("[llmusage] insert: %v", err)
 	}
@@ -346,6 +359,12 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		RawResponse: capt.RawResponse(),
 	}
 
+	if r.member != nil {
+		rec.ProfileID = r.member.ProfileID
+		rec.ModelID = r.member.ID
+		rec.MemberKey = r.member.MemberKey()
+		rec.UpstreamModelID = r.member.UpstreamModelID
+	}
 	if err := r.pg.InsertLLMRecord(rec); err != nil {
 		log.Printf("[llmrec] insert: %v", err)
 	}

@@ -372,6 +372,11 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	if t == nil {
 		return nil
 	}
+	ctx, finish, admitted := s.engine.beginTaskOperationContext(ctx, t.ID)
+	if !admitted {
+		return nil
+	}
+	defer finish()
 	// Use the SAME LLM the task runs on (its pinned profile, else the active profile),
 	// NOT agent.FromEnv() — the LLM is configured via the UI (DB profile), not env vars,
 	// so FromEnv returned empty and every task silently fell back to the crude rule
@@ -383,7 +388,15 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	s.engine.BeginLLMCall(t.ID)
-	goalRuntime := s.agentsForTask(t).runtime
+	bundle, err := s.agentsForTask(t, ctx)
+	if err != nil {
+		s.engine.EndLLMCall(t.ID)
+		if emit != nil {
+			emit(db.Activity{Worker: "system", Kind: "error", IsError: true, Summary: "任务代理不可用，无法启动目标拆解"})
+		}
+		return nil
+	}
+	goalRuntime := bundle.runtime
 	decomposed := agent.DecomposeGoalsWithProvider(ctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), emit)
 	s.engine.EndLLMCall(t.ID)
 	for _, g := range decomposed {

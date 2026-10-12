@@ -45,9 +45,9 @@ import {
 import { toast } from "sonner";
 
 import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
+import { ChannelModelChain } from "@/components/llm-selection";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
-import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
 import {
   AlertDialog,
@@ -119,7 +119,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import { chainValidationError, emptyModelCache, needModels } from "@/lib/llm-selection";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
+import { proxyErrorText, proxySelectable, taskProxyError } from "@/lib/proxy-center";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
   AssetInterceptRuleInput,
@@ -127,7 +129,10 @@ import type {
   Company,
   DeleteTaskOptions,
   DeleteTaskResult,
+  LLMModel,
   LLMProfile,
+  LLMSelection,
+  ProxyRecord,
   Task,
   TaskArchive,
   TaskArchiveState,
@@ -1223,9 +1228,7 @@ const TaskRow = React.memo(function TaskRow({
           const f = task.findings;
           const total = f ? f.critical + f.high + f.medium + f.low : 0;
           if (!f || total === 0) return <span className="text-muted-foreground">0</span>;
-          const seg = (n: number, cls: string) => (
-            <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>
-          );
+          const seg = (n: number, cls: string) => <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>;
           return (
             <span className="font-medium whitespace-nowrap" title="严重 / 高 / 中 / 低">
               {seg(f.critical, "text-rose-600 dark:text-rose-400")}
@@ -3078,10 +3081,21 @@ function CreateTaskSheet({
   const [goal, setGoal] = React.useState("");
   const [selectedTemplateID, setSelectedTemplateID] = React.useState<number | null>(null);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
+  // 任务候选链现在是"渠道 + 模型"的显式列表：每项可选跟随渠道默认或固定某成员。
+  const [members, setMembers] = React.useState<LLMSelection[]>([]);
+  const [activePosition, setActivePosition] = React.useState<number | null>(null);
+  const [modelsByProfile, setModelsByProfile] = React.useState<Record<string, LLMModel[] | undefined>>({});
+  const [loadingProfiles, setLoadingProfiles] = React.useState<Record<string, boolean>>({});
+  const modelCacheRef = React.useRef(emptyModelCache());
   const [companies, setCompanies] = React.useState<Company[]>([]);
   const [sourceTaskIDs, setSourceTaskIDs] = React.useState<string[]>([]);
   const [companyIDs, setCompanyIDs] = React.useState<number[]>([]);
-  const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
+  const [proxies, setProxies] = React.useState<ProxyRecord[]>([]);
+  const [globalProxyID, setGlobalProxyID] = React.useState<number | null>(null);
+  const [proxyCatalogLoading, setProxyCatalogLoading] = React.useState(true);
+  const [proxyCatalogError, setProxyCatalogError] = React.useState("");
+  const [proxyMode, setProxyMode] = React.useState<"inherit" | "direct" | "fixed">("inherit");
+  const [proxyID, setProxyID] = React.useState<number | undefined>(undefined);
   const [creating, setCreating] = React.useState(false);
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
@@ -3106,6 +3120,46 @@ function CreateTaskSheet({
       .then(setCompanies)
       .catch(() => setCompanies([]));
   }, []);
+
+  const reloadProxyCatalog = React.useCallback(async () => {
+    setProxyCatalogLoading(true);
+    try {
+      const result = await api.proxies();
+      setProxies(result.proxies ?? []);
+      setGlobalProxyID(result.global_proxy_id ?? null);
+      setProxyCatalogError("");
+    } catch (error) {
+      setProxyCatalogError(proxyErrorText(error));
+    } finally {
+      setProxyCatalogLoading(false);
+    }
+  }, []);
+  const proxyValidationError = taskProxyError({
+    loading: proxyCatalogLoading,
+    error: proxyCatalogError,
+    mode: proxyMode,
+    id: proxyID,
+    globalID: globalProxyID,
+    items: proxies,
+  });
+
+  // 候选链的渠道模型成员按需拉取：同一渠道并发打开下拉共享同一在途请求，
+  // 拉取期间该行显示"加载模型…"而不是空列表——否则会被误读成"这渠道没配模型"。
+  const loadProfileModels = React.useCallback(async (profileID: string) => {
+    setLoadingProfiles((prev) => ({ ...prev, [profileID]: true }));
+    try {
+      const models = await needModels(modelCacheRef.current, profileID, async (id) => {
+        const r = await api.llmModels(Number(id));
+        return r.models;
+      });
+      setModelsByProfile((prev) => ({ ...prev, [profileID]: models }));
+    } catch (e) {
+      toast.error(`读取渠道 #${profileID} 的模型列表失败：${(e as Error).message}`);
+    } finally {
+      setLoadingProfiles((prev) => ({ ...prev, [profileID]: false }));
+    }
+  }, []);
+  const chainError = chainValidationError(members);
 
   // pickFiles uploads the chosen files into this draft's staging dir and appends their
   // absolute paths to the description; the task's agents open them by path via Read/Bash.
@@ -3138,6 +3192,14 @@ function CreateTaskSheet({
       toast.error(`最多关联 ${MAX_SOURCE_TASKS} 个来源任务`);
       return;
     }
+    if (proxyValidationError) {
+      toast.error(proxyValidationError);
+      return;
+    }
+    if (chainError) {
+      toast.error(chainError);
+      return;
+    }
     setCreating(true);
     try {
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
@@ -3147,7 +3209,9 @@ function CreateTaskSheet({
         categoryId: categoryID,
         description: description.trim(),
         goal: goal.trim(),
-        llmProfileIds: llmProfileIDs.map(Number),
+        // members 永远显式发送（含空数组）：空数组是"继承 Agent 绑定/全局配置"的
+        // 明确语义，绝不能因为空就退回旧字段，否则用户清空候选链的意图会被旧链覆盖。
+        members,
         sourceTaskIds: sourceTaskIDs,
         companyIds: companyIDs,
         timeoutSeconds: timeoutSec,
@@ -3157,6 +3221,8 @@ function CreateTaskSheet({
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
+        proxyMode,
+        proxyId: proxyMode === "fixed" ? proxyID : undefined,
       });
       toast.success("任务已创建");
       setName("");
@@ -3166,7 +3232,10 @@ function CreateTaskSheet({
       setSelectedTemplateID(null);
       setSourceTaskIDs([]);
       setCompanyIDs([]);
-      setLLMProfileIDs([]);
+      setMembers([]);
+      setActivePosition(null);
+      setProxyMode("inherit");
+      setProxyID(undefined);
       setTimeoutMin("");
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
@@ -3177,14 +3246,20 @@ function CreateTaskSheet({
       setOpen(false);
       onCreated();
     } catch (e) {
-      toast.error("创建失败：" + (e as Error).message);
+      toast.error("创建失败：" + proxyErrorText(e));
     } finally {
       setCreating(false);
     }
   }
 
   return (
-    <Sheet open={open} onOpenChange={setOpen}>
+    <Sheet
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) void reloadProxyCatalog();
+      }}
+    >
       <SheetTrigger asChild>
         <Button size="sm">
           <PlusIcon /> 新建任务
@@ -3320,14 +3395,83 @@ function CreateTaskSheet({
             </Field>
             <Field>
               <FieldLabel htmlFor="llm-profiles">LLM 配置链</FieldLabel>
-              <TaskLLMProfileChain
+              <ChannelModelChain
                 profiles={profiles}
-                value={llmProfileIDs}
-                onValueChange={setLLMProfileIDs}
+                members={members}
+                activePosition={activePosition}
+                onMembersChange={setMembers}
+                onActivePositionChange={setActivePosition}
+                modelsByProfile={modelsByProfile}
+                onNeedModels={(id) => void loadProfileModels(id)}
+                loadingProfiles={loadingProfiles}
+                disabled={creating}
                 inputId="llm-profiles"
-                portalContainer={sheetContentRef}
               />
-              <FieldDescription>按列表顺序故障转移；第一项为当前配置，仅在明确额度不足时切换下一项。</FieldDescription>
+              <FieldDescription>
+                按列表顺序故障转移；第一项为当前配置，仅在明确额度不足时切换下一项。每项可选「跟随渠道默认模型」（渠道换默认时跟着换）或「固定某个模型成员」（渠道换默认不受影响）。
+              </FieldDescription>
+              {chainError && (
+                <p role="alert" className="text-destructive text-xs">
+                  {chainError}
+                </p>
+              )}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="task-proxy">任务代理</FieldLabel>
+              <select
+                id="task-proxy"
+                disabled={proxyCatalogLoading || !!proxyCatalogError || creating}
+                className="border-input bg-background h-10 w-full rounded-md border px-3 text-sm"
+                value={proxyMode === "fixed" ? `fixed:${proxyID ?? ""}` : proxyMode}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  if (value === "inherit" || value === "direct") {
+                    setProxyMode(value);
+                    setProxyID(undefined);
+                    return;
+                  }
+                  setProxyMode("fixed");
+                  setProxyID(Number(value.slice("fixed:".length)));
+                }}
+              >
+                <option value="inherit">继承全局默认代理</option>
+                <option value="direct">明确直连</option>
+                {proxies.map((proxy) => (
+                  <option key={proxy.id} value={`fixed:${proxy.id}`} disabled={!proxySelectable(proxy)}>
+                    #{proxy.id} {proxy.name}（{proxy.kind} · {proxy.status}
+                    {globalProxyID === proxy.id ? " · 默认" : ""}）
+                  </option>
+                ))}
+              </select>
+              <FieldDescription>
+                {proxyCatalogLoading
+                  ? "正在加载代理目录…"
+                  : proxyCatalogError
+                    ? `代理目录加载失败：${proxyCatalogError}`
+                    : "任务代理同时覆盖任务工具和该任务的 LLM API；创建时保存出口快照。灰色代理不可选，修复代理后再创建。"}
+              </FieldDescription>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={proxyCatalogLoading || creating}
+                onClick={() => void reloadProxyCatalog()}
+              >
+                {proxyCatalogError ? "重试加载代理" : "刷新代理目录"}
+              </Button>
+              {!proxyCatalogLoading && !proxyCatalogError && proxyValidationError && (
+                <p role="alert" className="text-destructive text-xs">
+                  {proxyValidationError}
+                </p>
+              )}
+              {!proxyCatalogLoading && !proxyCatalogError && proxyMode === "inherit" && (
+                <p className="text-muted-foreground text-xs">
+                  当前默认：
+                  {globalProxyID === null
+                    ? "直连"
+                    : `#${globalProxyID} ${proxies.find((proxy) => proxy.id === globalProxyID)?.name ?? "（记录未返回）"}`}
+                </p>
+              )}
             </Field>
 
             {/* 高级参数默认折叠:超时/心跳/首个意图,展开才占空间,常用路径保持清爽。 */}
@@ -3406,7 +3550,7 @@ function CreateTaskSheet({
           <SheetClose asChild>
             <Button variant="outline">取消</Button>
           </SheetClose>
-          <Button onClick={createTask} disabled={creating || uploading}>
+          <Button onClick={createTask} disabled={creating || uploading || !!proxyValidationError || !!chainError}>
             {creating && <Spinner data-icon="inline-start" />}
             {creating ? "创建中" : "创建"}
           </Button>

@@ -364,6 +364,9 @@ func (t *Traffic) Start() error { return t.proxy.Start() }
 // it holds a whole minutes-long budget, and finishing it is never worth delaying
 // shutdown for — the next deletion resumes it.
 func (t *Traffic) Close() error {
+	if t.proxy != nil {
+		_ = t.proxy.Close()
+	}
 	if t.closed != nil {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}

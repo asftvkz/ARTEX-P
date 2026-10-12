@@ -1,8 +1,8 @@
 package db
 
 import (
+	"context"
 	"database/sql"
-	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -10,9 +10,16 @@ import (
 
 const IntentBlockedLLMQuota = "llm_quota_exhausted"
 
+func (s *ExplorationStore) ResolveLLMMember(selection LLMModelSelection) (*LLMModel, error) {
+	return s.db.ResolveLLMModel(context.Background(), selection)
+}
+
 // TaskLLMProfile is one ordered entry in a task's explicit failover chain.
 type TaskLLMProfile struct {
 	ProfileID   int64      `json:"profile_id"`
+	ModelMode   string     `json:"model_mode"`
+	ModelID     *int64     `json:"model_id"`
+	Active      bool       `json:"-"`
 	Position    int        `json:"position"`
 	Status      string     `json:"status"`
 	LastError   string     `json:"last_error,omitempty"`
@@ -32,6 +39,8 @@ type TaskSource struct {
 // quota-exhausted. NextProfileID is nil when the explicit chain is exhausted.
 type TaskLLMTransition struct {
 	PreviousProfileID int64
+	PreviousModelID   int64
+	NextPosition      *int
 	NextProfileID     *int64
 	ChainExhausted    bool
 	Advanced          bool
@@ -76,6 +85,8 @@ func applyTaskLLMContext(
 	t.ActiveLLMProfileID = activeProfileID
 	t.LLMChainRevision = revision
 	t.LLMProfileIDs = make([]int64, 0, len(chain))
+	t.LLMMembers = make([]LLMModelSelection, 0, len(chain))
+	t.ActiveLLMPosition = nil
 	t.LLMFailoverState = "default"
 	t.LLMFailoverReason = ""
 	var latest *TaskLLMProfile
@@ -83,7 +94,12 @@ func applyTaskLLMContext(
 	for i := range chain {
 		entry := chain[i]
 		t.LLMProfileIDs = append(t.LLMProfileIDs, entry.ProfileID)
-		if t.ActiveLLMProfileID != nil && entry.ProfileID == *t.ActiveLLMProfileID && entry.Status == "ready" {
+		t.LLMMembers = append(t.LLMMembers, LLMModelSelection{ProfileID: entry.ProfileID, ModelMode: entry.ModelMode, ModelID: entry.ModelID}.Normalized())
+		if entry.Active {
+			pos := entry.Position
+			t.ActiveLLMPosition = &pos
+		}
+		if entry.Active && entry.Status == "ready" {
 			activeReady = true
 		}
 		if entry.ExhaustedAt != nil && (latest == nil || entry.ExhaustedAt.After(*latest.ExhaustedAt)) {
@@ -137,9 +153,11 @@ func (d *DB) hydrateTasksContext(tasks []*Task) error {
 
 	rows, err := d.Query(`
 SELECT t.id, t.llm_profile_id, t.active_llm_profile_id, t.llm_chain_revision,
-       p.profile_id, p.position, p.status, COALESCE(p.last_error,''), p.exhausted_at
+       p.profile_id, p.position, CASE WHEN p.model_mode='channel-default' AND p.exhausted_model_id IS NOT NULL AND p.exhausted_model_id IS DISTINCT FROM lp.default_model_id THEN 'ready' ELSE p.status END, COALESCE(p.last_error,''), p.exhausted_at,
+       p.model_mode,p.model_id,COALESCE(p.position=t.active_llm_position,false)
 FROM tasks t
 LEFT JOIN task_llm_profiles p ON p.task_id=t.id
+LEFT JOIN llm_profiles lp ON lp.id=p.profile_id
 WHERE t.id=ANY($1::bigint[])
 ORDER BY t.id, p.position NULLS LAST`, ids)
 	if err != nil {
@@ -149,10 +167,13 @@ ORDER BY t.id, p.position NULLS LAST`, ids)
 		var taskID, revision int64
 		var legacy, active, profileID, position sql.NullInt64
 		var status, lastError sql.NullString
+		var mode sql.NullString
+		var modelID *int64
+		var isActive bool
 		var exhaustedAt sql.NullTime
 		if err := rows.Scan(
 			&taskID, &legacy, &active, &revision,
-			&profileID, &position, &status, &lastError, &exhaustedAt,
+			&profileID, &position, &status, &lastError, &exhaustedAt, &mode, &modelID, &isActive,
 		); err != nil {
 			rows.Close()
 			return err
@@ -172,6 +193,7 @@ ORDER BY t.id, p.position NULLS LAST`, ids)
 		}
 		if profileID.Valid {
 			entry := TaskLLMProfile{
+				ModelMode: mode.String, ModelID: modelID, Active: isActive,
 				ProfileID: profileID.Int64,
 				Position:  int(position.Int64),
 				Status:    status.String,
@@ -260,9 +282,11 @@ ORDER BY task_id, id`, ids)
 func (d *DB) taskLLMContext(taskID int64) (*int64, *int64, int64, []TaskLLMProfile, error) {
 	rows, err := d.Query(`
 SELECT t.llm_profile_id, t.active_llm_profile_id, t.llm_chain_revision,
-       p.profile_id, p.position, p.status, COALESCE(p.last_error,''), p.exhausted_at
+       p.profile_id, p.position, CASE WHEN p.model_mode='channel-default' AND p.exhausted_model_id IS NOT NULL AND p.exhausted_model_id IS DISTINCT FROM lp.default_model_id THEN 'ready' ELSE p.status END, COALESCE(p.last_error,''), p.exhausted_at,
+       p.model_mode,p.model_id,COALESCE(p.position=t.active_llm_position,false)
 FROM tasks t
 LEFT JOIN task_llm_profiles p ON p.task_id=t.id
+LEFT JOIN llm_profiles lp ON lp.id=p.profile_id
 WHERE t.id=$1
 ORDER BY p.position NULLS LAST`, taskID)
 	if err != nil {
@@ -280,8 +304,11 @@ ORDER BY p.position NULLS LAST`, taskID)
 		var legacy, active, profileID, position sql.NullInt64
 		var rowRevision int64
 		var status, lastError sql.NullString
+		var mode sql.NullString
+		var modelID *int64
+		var isActive bool
 		var exhaustedAt sql.NullTime
-		if err := rows.Scan(&legacy, &active, &rowRevision, &profileID, &position, &status, &lastError, &exhaustedAt); err != nil {
+		if err := rows.Scan(&legacy, &active, &rowRevision, &profileID, &position, &status, &lastError, &exhaustedAt, &mode, &modelID, &isActive); err != nil {
 			return nil, nil, 0, nil, err
 		}
 		if !found {
@@ -300,6 +327,7 @@ ORDER BY p.position NULLS LAST`, taskID)
 			continue
 		}
 		entry := TaskLLMProfile{
+			ModelMode: mode.String, ModelID: modelID, Active: isActive,
 			ProfileID: profileID.Int64,
 			Position:  int(position.Int64),
 			Status:    status.String,
@@ -382,7 +410,7 @@ ORDER BY r.created_at, r.source_task_id`, taskID)
 }
 
 func (d *DB) TaskLLMProfiles(taskID int64) ([]TaskLLMProfile, error) {
-	rows, err := d.Query(`SELECT profile_id, position, status, COALESCE(last_error,''), exhausted_at
+	rows, err := d.Query(`SELECT profile_id, position, status, COALESCE(last_error,''), exhausted_at,model_mode,model_id
 FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, taskID)
 	if err != nil {
 		return nil, err
@@ -391,7 +419,7 @@ FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, taskID)
 	var out []TaskLLMProfile
 	for rows.Next() {
 		var entry TaskLLMProfile
-		if err := rows.Scan(&entry.ProfileID, &entry.Position, &entry.Status, &entry.LastError, &entry.ExhaustedAt); err != nil {
+		if err := rows.Scan(&entry.ProfileID, &entry.Position, &entry.Status, &entry.LastError, &entry.ExhaustedAt, &entry.ModelMode, &entry.ModelID); err != nil {
 			return nil, err
 		}
 		out = append(out, entry)
@@ -405,51 +433,20 @@ FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, taskID)
 // 终态(done/failed/timeout)任务同样允许改链:任务结束后主 Agent 对话仍会走这条链,
 // 链上模型不可用时必须能换,否则已完成任务就再也没法交互了。
 func (d *DB) ReplaceTaskLLMProfiles(taskID int64, profileIDs []int64, activeProfileID int64) error {
-	tx, err := d.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Keep the task -> profile lock order shared by all task LLM mutations and
-	// DeleteProfile. Inserts below may take KEY SHARE locks on llm_profiles for
-	// their foreign keys, so the task row must be locked before any of them.
-	var lockedID int64
-	if err := tx.QueryRow(`SELECT id FROM tasks WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, taskID).Scan(&lockedID); err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("task %d not found", taskID)
+	var position *int
+	if activeProfileID != 0 {
+		for i, id := range profileIDs {
+			if id == activeProfileID {
+				pos := i
+				position = &pos
+				break
+			}
 		}
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM task_llm_profiles WHERE task_id=$1`, taskID); err != nil {
-		return err
-	}
-	if err := insertTaskLLMProfiles(tx, taskID, profileIDs); err != nil {
-		return err
-	}
-	if len(profileIDs) == 0 {
-		activeProfileID = 0
-	} else if activeProfileID == 0 {
-		activeProfileID = profileIDs[0]
-	}
-	if activeProfileID > 0 {
-		found := false
-		for _, id := range profileIDs {
-			found = found || id == activeProfileID
-		}
-		if !found {
-			return fmt.Errorf("active LLM profile %d is not in the task chain", activeProfileID)
+		if position == nil {
+			return ErrLLMModelInvalid
 		}
 	}
-	var active any
-	if activeProfileID > 0 {
-		active = activeProfileID
-	}
-	if _, err := tx.Exec(`UPDATE tasks
-SET active_llm_profile_id=$2, llm_profile_id=$2, llm_chain_revision=llm_chain_revision+1
-WHERE id=$1`, taskID, active); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return d.ReplaceTaskLLMMembers(taskID, selectionsFromProfiles(profileIDs), position)
 }
 
 // MarkTaskLLMProfileQuotaExhausted advances the shared task cursor once. A late
@@ -526,7 +523,7 @@ ORDER BY position LIMIT 1`, taskID, position).Scan(&next)
 		out.Advanced = true
 		out.NextProfileID = &next
 		if _, err := tx.Exec(`UPDATE tasks
-				SET active_llm_profile_id=$2, llm_profile_id=$2, llm_chain_revision=llm_chain_revision+1
+				SET active_llm_profile_id=$2, llm_profile_id=$2, active_llm_position=(SELECT position FROM task_llm_profiles WHERE task_id=$1 AND profile_id=$2 ORDER BY position LIMIT 1), llm_chain_revision=llm_chain_revision+1
 				WHERE id=$1`, taskID, next); err != nil {
 			return out, err
 		}
@@ -534,7 +531,7 @@ ORDER BY position LIMIT 1`, taskID, position).Scan(&next)
 		out.Advanced = true
 		out.ChainExhausted = true
 		if _, err := tx.Exec(`UPDATE tasks
-				SET active_llm_profile_id=NULL, llm_profile_id=NULL, llm_chain_revision=llm_chain_revision+1
+				SET active_llm_profile_id=NULL, llm_profile_id=NULL, active_llm_position=NULL, llm_chain_revision=llm_chain_revision+1
 				WHERE id=$1`, taskID); err != nil {
 			return out, err
 		}

@@ -18,12 +18,14 @@ import (
 // with the recorder by the caller, so a failed attempt is still recorded under
 // its own profile name).
 type Member struct {
-	ID       int64  // llm_profiles.id
-	Name     string // profile name, for logs / UI
-	Model    string
-	Format   string // "anthropic" | "openai"
-	Priority int    // the profile's configured priority (display only)
-	Active   bool   // is_default (display only)
+	ID        int64 // llm_profiles.id
+	ModelID   int64
+	MemberKey string
+	Name      string // profile name, for logs / UI
+	Model     string
+	Format    string // "anthropic" | "openai"
+	Priority  int    // the profile's configured priority (display only)
+	Active    bool   // is_default (display only)
 	// Rank is the ordering key the caller assigned: higher goes first, and members
 	// sharing a Rank take turns leading (load-spreading across duplicate keys).
 	// The caller encodes "active profile heads the chain" as a Rank above every
@@ -33,6 +35,16 @@ type Member struct {
 	// window can't hold the request is skipped rather than made to fail on it.
 	WindowTokens int
 	Prov         llm.Provider
+}
+
+func (m *Member) healthKey() string {
+	if m.MemberKey != "" {
+		return m.MemberKey
+	}
+	if m.ModelID > 0 {
+		return fmt.Sprintf("%d:%d", m.ID, m.ModelID)
+	}
+	return strconv.FormatInt(m.ID, 10)
 }
 
 // RankActive is the Rank the caller gives the chain head (the active profile, or
@@ -100,12 +112,12 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 				}
 			}
 			if failed == nil {
-				p.health.Pass(m.ID) // completed (or failed in a non-failover way)
+				p.health.Pass(m.healthKey()) // completed (or failed in a non-failover way)
 				return
 			}
 			lastErr = failed
 			hard := isHardFailure(failed)
-			if p.health.Trip(m.ID, trimErr(failed), hard) {
+			if p.health.Trip(m.healthKey(), trimErr(failed), hard) {
 				log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(failed))
 			}
 			if i+1 < len(order) {
@@ -133,18 +145,18 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 	for i, m := range order {
 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
 		if err == nil {
-			p.health.Pass(m.ID)
+			p.health.Pass(m.healthKey())
 			return msg, sr, usage, nil
 		}
 		if !shouldFailover(ctx, err) {
 			// Non-failover error (e.g. ctx cancel, deterministic 4xx): surface as-is
 			// without tripping health, matching Stream's non-failover path.
-			p.health.Pass(m.ID)
+			p.health.Pass(m.healthKey())
 			return llm.Message{}, "", llm.Usage{}, err
 		}
 		lastErr = err
 		hard := isHardFailure(err)
-		if p.health.Trip(m.ID, trimErr(err), hard) {
+		if p.health.Trip(m.healthKey(), trimErr(err), hard) {
 			log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(err))
 		}
 		if i+1 < len(order) {
@@ -169,7 +181,7 @@ func (p *Pool) order(req llm.CompletionRequest) []*Member {
 	est := estimateTokens(req)
 	var open []*Member
 	for _, m := range p.members {
-		if p.health.IsOpen(m.ID) {
+		if p.health.IsOpen(m.healthKey()) {
 			continue
 		}
 		if m.WindowTokens > 0 && est > m.WindowTokens {

@@ -323,7 +323,8 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec := httptest.NewRecorder()
 	s.deepenFinding(rec, req)
-	if rec.Code != http.StatusInternalServerError {
+	// 统一操作准入先拒绝软删除任务，不再先创建意图再回滚。
+	if rec.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	after, err := task.Store.ListByKind(db.KindIntent, 1000)

@@ -7,7 +7,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 🌐 **在线 Demo（模拟数据）**： [https://artex-demo.mhtsec.com](https://artex-demo.mhtsec.com)
 
-📦 **该仓库为ARTEX最后一个版本纯源码备份。原 Docker 镜像源 `autumn27/artex` 已失效，现由本仓库自维护镜像 `mianhuatang11/artex`（Docker Hub）；拉取失败时可 `docker compose build` 从纯源码本地构建，无任何外部预编译依赖。**
+📦 **本仓库在上游源码基础上持续维护代理中心、多模型与 WARP 功能。镜像发布到 [GitHub Packages](https://github.com/moeacgx/ARTEX/pkgs/container/artex)，安装包发布到 [Releases](https://github.com/moeacgx/ARTEX/releases)，页面一键更新使用本仓库发布源。**
 
 </div>
 
@@ -71,7 +71,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/mhtsec/ARTEX.git
+git clone https://github.com/moeacgx/ARTEX.git
 cd ARTEX
 ./install.sh
 ```
@@ -86,14 +86,14 @@ cd ARTEX
 ### 方式二：Docker Compose（手动）
 
 ```bash
-git clone https://github.com/mhtsec/ARTEX.git
+git clone https://github.com/moeacgx/ARTEX.git
 cd ARTEX
 cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 mianhuatang11/artex 镜像 + postgres
+docker compose up -d          # 拉取 ghcr.io/moeacgx/artex 镜像 + postgres
 # → http://localhost:8787
 ```
 
-> 原镜像源 `autumn27/artex` 已从 Docker Hub 删除，镜像现由本仓库自维护为 **`mianhuatang11/artex`**。
+> 镜像源为 **`ghcr.io/moeacgx/artex`**，支持 Linux amd64 / arm64；正式版本同时提供 `v2.2.1` 这样的固定标签和 `latest`。
 > 镜像源不可用（或想自行改代码）时，本地从纯源码构建即可：`docker compose build && docker compose up -d`。
 > Dockerfile 为多阶段构建（前端静态导出 → Go 静态编译 → 运行镜像），默认走国内友好依赖源，可加 `--build-arg GOPROXY=... / --build-arg NPM_REGISTRY=...` 覆盖。
 
@@ -106,7 +106,7 @@ docker compose up -d          # 拉取 mianhuatang11/artex 镜像 + postgres
 
 ### 方式三：下载预编译二进制（Releases）
 
-到原仓库 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip（**本备份仓库不托管二进制**，若原 Releases 也失效请用方式二或方式四）：解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
+到本仓库 [Releases](https://github.com/moeacgx/ARTEX/releases) 下载对应平台的 zip，并使用同一 Release 的 `SHA256SUMS` 校验。解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
 
 ```bash
 cp config.example.json config.json   # 填好 database 连接
@@ -134,7 +134,7 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 ```bash
 ./build.sh --release
-# 产物：dist/artex-0.3.3-*.zip
+# 产物：dist/artex-2.2.1-*.zip
 ```
 
 UPX 自解压二进制可能与部分 Linux 内核、虚拟化环境或安全策略不兼容，因此默认不启用。可用 `ARTEX_TARGETS` 自定义目标；确认目标运行环境兼容时，可显式传入 `--upx` 进一步缩小二进制：
@@ -146,11 +146,24 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 ---
 
+## 自动发布
+
+推送正式版本标签即可触发 `.github/workflows/release.yml`，无需 Docker Hub token：
+
+```bash
+git tag v2.2.1
+git push origin v2.2.1
+```
+
+工作流先验证更新模块并导出非 Mock 前端，再生成 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 五份 zip。镜像复用这些 Release 二进制，通过 `GITHUB_TOKEN` 发布 `ghcr.io/moeacgx/artex:v2.2.1` 与 `latest`。两种架构镜像均发布成功后，才发布带 `SHA256SUMS` 的正式 Release。版本标签仅接受 `v主版本.次版本.修订号`；不覆盖既有标签。
+
 ## 更新升级
 
 > 升级只换程序、不动数据：Postgres 数据卷 `pgdata`、`./data`（jwt.key / SQLite 等）、`./skills` 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
 
 ### 方式一：页面一键更新（推荐）
+
+更新源固定为 **`moeacgx/ARTEX`**，不会回退到原作者或上游仓库。已有 `dev` 或带提交后缀的构建需先通过镜像或安装包换到正式版本。
 
 在 **系统配置** 页（侧边栏「系统配置」→ `/system/settings`）的**版本与更新**卡片里，可以直接检查并安装新版本，无需登录服务器。
 
@@ -180,7 +193,7 @@ cd ARTEX
 ```bash
 cd ARTEX
 git pull                       # 更新 compose / 脚本（可选）
-# 指定版本：在 .env 设 ARTEX_TAG=v0.2.0；不设则用 latest
+# 指定版本：在 .env 设 ARTEX_TAG=v2.2.1；不设则用 latest
 docker compose pull artex
 docker compose up -d artex     # 换新镜像重启 → 自动迁移 schema
 docker image prune -f          # 清理旧镜像（可选）
@@ -188,7 +201,7 @@ docker image prune -f          # 清理旧镜像（可选）
 
 ### 方式四：预编译二进制（Releases）
 
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
+到 [Releases](https://github.com/moeacgx/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
 
 ```bash
 cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./

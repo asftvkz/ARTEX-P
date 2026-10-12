@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,8 +91,9 @@ type Server struct {
 	// profChatAgents caches a per-profile ChatAgent (chat page), keyed by profile id.
 	// Built lazily on first use; invalidated when any profile is saved/activated/deleted
 	// so edits take effect.
-	profMu         sync.Mutex
-	profChatAgents map[int64]*agent.ChatAgent // per-profile ChatAgent cache (chat page)
+	profMu          sync.Mutex
+	profChatAgents  map[int64]*agent.ChatAgent // per-profile ChatAgent cache (chat page)
+	modelChatAgents map[string]*agent.ChatAgent
 
 	// provByProfile caches ONE provider per LLM profile id so every agent bound or
 	// pinned to the same profile shares a single provider instance — hence one rate
@@ -100,6 +102,7 @@ type Server struct {
 	// configured request rate. Cleared on profile edits, then repopulated by active reapply.
 	provCacheMu   sync.Mutex
 	provByProfile map[int64]*provEntry
+	provByModel   map[string]*provEntry
 	provCacheGen  uint64
 
 	// llmHealth is the process-wide circuit-breaker state for LLM failover (轮询).
@@ -158,13 +161,18 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Every task uses a stable task router. An empty explicit chain is resolved by
 	// that router through Agent bindings and then the global provider, so adding a
 	// first chain to a running task takes effect on its very next LLM call.
-	s.engine.SetAuthoritativeAgentResolver(func(t *Task) (*agent.Planner, *agent.Worker) {
+	s.engine.taskReadiness = func(t *Task) bool { return s.taskRuntimeAvailable(t, "planner", "worker") }
+	s.engine.resolveContext = func(ctx context.Context, t *Task) (*agent.Planner, *agent.Worker) {
 		if !s.taskRuntimeAvailable(t, "planner", "worker") {
 			return nil, nil
 		}
-		b := s.agentsForTask(t)
+		b, err := s.agentsForTask(t, ctx)
+		if err != nil {
+			log.Printf("[engine] 任务代理不可用: %v", err)
+			return nil, nil
+		}
 		return b.pl, b.wk
-	})
+	}
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {
@@ -217,7 +225,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
-		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
+		wireAgentAugment(m.pg, s.skillDir, s.hostTools, m) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
@@ -325,16 +333,8 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	if err != nil || p == nil {
 		return agent.Config{}, false
 	}
-	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
-	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
-	cfg.ContextWindowK = p.ContextWindowK
-	cfg.ThinkingType = p.ThinkingType
-	cfg.ReasoningEffort = p.ReasoningEffort
-	cfg.Stream = p.Streaming
-	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
-	cfg.SessionHeaderKey = p.SessionHeaderKey
-	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	cfg, ok := s.loadProfileConfig(p.ID)
+	if !ok {
 		return cfg, false
 	}
 	s.cfgMu.Lock()
@@ -431,11 +431,19 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// and Agent bindings, otherwise each path owns a separate rate limiter.
 	if active, _ := s.m.pg.ActiveProfile(); active != nil {
 		if activeCfg, ok := s.loadProfileConfig(active.ID); ok && activeCfg == cfg {
-			prov, _, _ = s.providerForProfile(active.ID)
+			var ready bool
+			prov, _, ready = s.providerForProfile(active.ID)
+			if !ready {
+				return db.ErrLLMModelUnavailable
+			}
 		}
 	}
 	if prov == nil {
 		var err error
+		cfg.Proxy, err = s.m.ResolveLLMProxy(context.Background(), nil, cfg.Proxy)
+		if err != nil {
+			return err
+		}
 		prov, err = cfg.NewProvider()
 		if err != nil {
 			return err
@@ -446,6 +454,10 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		s.cfgMu.Unlock()
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
 		prov = bindSideProvider(prov, cfg, 0, profName)
+	}
+	toolProxy, err := s.m.ResolveLLMProxy(context.Background(), nil, "")
+	if err != nil {
+		return err
 	}
 	s.cfgMu.Lock()
 	s.llmDirect = prov
@@ -470,7 +482,8 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
-	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	s.chatAgent.SetProxy(toolProxy, "")
+	s.chatAgent.SetStrictProxy(true)
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
 	s.chatAgent.SetGuard(s.chatGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
@@ -492,11 +505,20 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 // loadProfileConfig builds an agent.Config from a specific profile id (with its key).
 // ok=false when the profile is missing or has no api key.
 func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
-	p, err := s.m.pg.ProfileByID(id)
+	cfg, _, ok := s.loadSelectionConfig(db.LLMModelSelection{ProfileID: id})
+	return cfg, ok
+}
+
+func (s *Server) loadSelectionConfig(selection db.LLMModelSelection) (agent.Config, *db.LLMModel, bool) {
+	p, err := s.m.pg.ProfileByID(selection.ProfileID)
 	if err != nil || p == nil {
-		return agent.Config{}, false
+		return agent.Config{}, nil, false
 	}
-	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	model, err := s.m.pg.ResolveLLMModel(context.Background(), selection)
+	if err != nil {
+		return agent.Config{}, nil, false
+	}
+	cfg := agent.ConfigFrom(p.Format, model.UpstreamModelID, p.BaseURL, p.APIKey, p.Proxy)
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
@@ -506,9 +528,9 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
-		return cfg, false
+		return cfg, model, false
 	}
-	return cfg, true
+	return cfg, model, true
 }
 
 // effectiveProfileForAgent resolves the LLM profile id an agent should run on, by
@@ -532,13 +554,23 @@ func (s *Server) effectiveProfileForAgent(agentKey string, pinID *int64) *int64 
 // picked a valid profile still got rejected with "LLM 未配置" when no global
 // config was active.
 func (s *Server) resolveChatAgent(c *db.Conversation) *agent.ChatAgent {
-	ca := s.chatAgentRef()
-	if eff := s.effectiveProfileForAgent(c.AgentKey, c.LLMProfileID); eff != nil {
-		if pa := s.chatAgentForProfile(*eff); pa != nil {
-			ca = pa
+	if s.m.pg != nil {
+		if a, _ := s.m.pg.GetAgentByKey(c.AgentKey); a != nil && a.LLMProfileID != nil {
+			return s.chatAgentForSelection(db.LLMModelSelection{ProfileID: *a.LLMProfileID, ModelMode: a.LLMModelMode, ModelID: a.LLMModelID})
+		}
+		if c.LLMProfileID != nil {
+			return s.chatAgentForSelection(db.LLMModelSelection{ProfileID: *c.LLMProfileID, ModelMode: c.LLMModelMode, ModelID: c.LLMModelID})
+		}
+		s.cfgMu.Lock()
+		configured := s.llmOn && s.chatAgent != nil
+		s.cfgMu.Unlock()
+		if configured {
+			if p, _ := s.m.pg.ActiveProfile(); p != nil {
+				return s.globalChatAgent()
+			}
 		}
 	}
-	return ca
+	return s.chatAgentRef()
 }
 
 // chatUnavailableReason explains why no ChatAgent could be resolved, so the user
@@ -560,17 +592,38 @@ func (s *Server) chatUnavailableReason() string {
 // bound/pinned to the same profile shares one provider instance (one rate limiter).
 // ok=false when the profile is missing/invalid → caller falls back to the global pair.
 func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool) {
+	return s.providerForSelection(db.LLMModelSelection{ProfileID: id})
+}
+
+func (s *Server) providerForSelection(selection db.LLMModelSelection) (llm.Provider, agent.Config, bool) {
+	return s.providerForTaskSelection(selection, nil)
+}
+
+func (s *Server) providerForTaskSelection(selection db.LLMModelSelection, t *Task, contexts ...context.Context) (llm.Provider, agent.Config, bool) {
+	cfg, model, ok := s.loadSelectionConfig(selection)
+	if !ok {
+		return nil, agent.Config{}, false
+	}
+	p, err := s.m.pg.ProfileByID(selection.ProfileID)
+	if err != nil || p == nil {
+		return nil, agent.Config{}, false
+	}
+	proxy, err := s.m.ResolveLLMProxySelection(firstContext(contexts), t, p.Proxy, p.ProxyMode, p.ProxyID)
+	if err != nil {
+		return nil, agent.Config{}, false
+	}
+	cfg.Proxy = proxy
+	id, key := selection.ProfileID, fmt.Sprintf("%s:%x", model.MemberKey(), sha256.Sum256([]byte(proxy)))
 	s.provCacheMu.Lock()
-	if e := s.provByProfile[id]; e != nil {
+	if s.provByModel == nil {
+		s.provByModel = map[string]*provEntry{}
+	}
+	if e := s.provByModel[key]; e != nil && e.cfg == cfg {
 		s.provCacheMu.Unlock()
 		return e.prov, e.cfg, true
 	}
 	generation := s.provCacheGen
 	s.provCacheMu.Unlock()
-	cfg, ok := s.loadProfileConfig(id)
-	if !ok {
-		return nil, agent.Config{}, false
-	}
 	prov, err := cfg.NewProvider()
 	if err != nil {
 		log.Printf("[engine] build provider for LLM profile %d failed: %v", id, err)
@@ -578,18 +631,18 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	}
 	// Wrap with recorder, tagged with this profile's name.
 	if p, _ := s.m.pg.ProfileByID(id); p != nil {
-		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled, *model)
 		prov = bindSideProvider(prov, cfg, id, p.Name)
 	}
 	s.provCacheMu.Lock()
 	if generation != s.provCacheGen {
 		s.provCacheMu.Unlock()
-		return s.providerForProfile(id)
+		return s.providerForTaskSelection(selection, t, contexts...)
 	}
-	if e := s.provByProfile[id]; e != nil { // lost the race → keep the winner
+	if e := s.provByModel[key]; e != nil && e.cfg == cfg { // lost the race → keep the winner
 		prov, cfg = e.prov, e.cfg
 	} else {
-		s.provByProfile[id] = &provEntry{prov: prov, cfg: cfg}
+		s.provByModel[key] = &provEntry{prov: prov, cfg: cfg}
 		log.Printf("[engine] built provider for LLM profile %d (%s / %s)", id, cfg.Provider(), cfg.Model)
 	}
 	s.provCacheMu.Unlock()
@@ -599,29 +652,76 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
 func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
+	return s.chatAgentForSelection(db.LLMModelSelection{ProfileID: id})
+}
+
+func (s *Server) globalChatAgent() *agent.ChatAgent {
+	_, cfg, ok := s.globalProvider()
+	if !ok {
+		return nil
+	}
+	proxy, err := s.m.ResolveLLMProxy(context.Background(), nil, "")
+	if err != nil {
+		return nil
+	}
+	ca := agent.NewChatAgent(globalConversationProvider{s: s}, cfg.Model, s.m.dir, transcript.NewStore(filepath.Join(s.m.dir, "transcripts")), cfg.CompactionWindow())
+	ca.SetProxy(proxy, "")
+	ca.SetStrictProxy(true)
+	ca.SetWebSearch(s.m.WebSearchOpts())
+	ca.SetGuard(s.chatGuard())
+	ca.SetNonStreaming(nonStreamingResolver(cfg))
+	ca.SetMaxTokens(maxTokensResolver(cfg))
+	ca.SetNoaEnabled(s.m.NoaCompactionEnabled)
+	return ca
+}
+
+func (s *Server) chatAgentForSelection(selection db.LLMModelSelection) *agent.ChatAgent {
+	_, model, ok := s.loadSelectionConfig(selection)
+	if !ok {
+		return nil
+	}
+	s.provCacheMu.Lock()
+	generation := s.provCacheGen
+	s.provCacheMu.Unlock()
+	prov, cfg, ok := s.providerForSelection(db.LLMModelSelection{ProfileID: selection.ProfileID, ModelMode: db.LLMModelModeFixed, ModelID: &model.ID})
+	if !ok {
+		return nil
+	}
+	toolProxy, err := s.m.ResolveLLMProxy(context.Background(), nil, "")
+	if err != nil {
+		return nil
+	}
+	id, key := selection.ProfileID, fmt.Sprintf("%s:%x", model.MemberKey(), sha256.Sum256([]byte(fmt.Sprintf("%#v|%s|%t|%t", cfg, toolProxy, s.m.LLMPoolEnabled(), s.m.LLMPoolBindFallback()))))
 	s.profMu.Lock()
-	cached := s.profChatAgents[id]
+	if s.modelChatAgents == nil {
+		s.modelChatAgents = map[string]*agent.ChatAgent{}
+	}
+	cached := s.modelChatAgents[key]
 	s.profMu.Unlock()
 	if cached != nil {
 		return cached
 	}
-	prov, cfg, ok := s.providerForProfile(id)
-	if !ok {
-		return nil
-	}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
-	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	ca.SetProxy(toolProxy, "")
+	ca.SetStrictProxy(true)
 	ca.SetWebSearch(s.m.WebSearchOpts())
 	ca.SetGuard(s.chatGuard())
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
 	s.profMu.Lock()
-	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
+	s.provCacheMu.Lock()
+	stale := generation != s.provCacheGen
+	s.provCacheMu.Unlock()
+	if stale {
+		s.profMu.Unlock()
+		return s.chatAgentForSelection(selection)
+	}
+	if ex := s.modelChatAgents[key]; ex != nil { // lost the race → keep the winner
 		ca = ex
 	} else {
-		s.profChatAgents[id] = ca
+		s.modelChatAgents[key] = ca
 	}
 	s.profMu.Unlock()
 	return ca
@@ -633,10 +733,12 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 func (s *Server) invalidateProfileAgents() {
 	s.profMu.Lock()
 	s.profChatAgents = map[int64]*agent.ChatAgent{}
+	s.modelChatAgents = map[string]*agent.ChatAgent{}
 	s.profMu.Unlock()
 	s.provCacheMu.Lock()
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}
+	s.provByModel = map[string]*provEntry{}
 	s.provCacheMu.Unlock()
 	s.invalidateTaskAgents()
 }
@@ -650,6 +752,8 @@ func (s *Server) chatAgentRef() *agent.ChatAgent {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerSideRoutes(mux)
+	s.RegisterLLMModelRoutes(mux)
+	s.RegisterProxyActionRoutes(mux)
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
@@ -798,6 +902,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/records/by-model", s.pgTokenByModel) // 按模型聚合本任务 token 用量
 	mux.HandleFunc("GET /api/llm/records/{id}", s.pgGetLLMRecord)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
+	mux.HandleFunc("GET /api/proxies", s.listProxies)
+	mux.HandleFunc("POST /api/proxies", s.createProxy)
+	mux.HandleFunc("PUT /api/proxies/{id}", s.updateProxy)
+	mux.HandleFunc("DELETE /api/proxies/{id}", s.deleteProxy)
+	mux.HandleFunc("POST /api/proxies/{id}/test", s.testProxy)
+	mux.HandleFunc("PUT /api/proxies/global", s.setGlobalProxy)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
 	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
 	// REST 接口，而不是塞进扁平的 /api/settings 键值里。
@@ -1365,22 +1475,62 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
-		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
-		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		llmProfileProxyRequest
+		Provider         string             `json:"provider"`
+		Model            string             `json:"model"`
+		BaseURL          string             `json:"base_url"`
+		APIKey           string             `json:"api_key"`
+		ThinkingType     string             `json:"thinking_type"`
+		ReasoningEffort  string             `json:"reasoning_effort"`
+		ProfileID        *llmModelRequestID `json:"profile_id"`         // 兼容字符串和旧整数。
+		Streaming        *bool              `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
+		SessionHeaderKey string             `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	var channel db.LLMProfile
+	if req.ProfileID != nil {
+		p, err := s.m.pg.ProfileByID(int64(*req.ProfileID))
+		if err != nil {
+			writeErr(w, 500, "读取渠道失败")
+			return
+		}
+		if p == nil {
+			writeErr(w, 404, "渠道不存在")
+			return
+		}
+		channel = *p
+		if req.Provider == "" {
+			req.Provider = p.Format
+		}
+		if req.Model == "" {
+			req.Model = p.Model
+		}
+		if req.BaseURL == "" {
+			req.BaseURL = p.BaseURL
+		}
+		if req.APIKey == "" {
+			req.APIKey = p.APIKey
+		}
+		if req.SessionHeaderKey == "" {
+			req.SessionHeaderKey = p.SessionHeaderKey
+		}
+		if req.Streaming == nil {
+			req.Streaming = &p.Streaming
+		}
+	}
+	if err := req.llmProfileProxyRequest.apply(&channel); err != nil {
+		writeErr(w, 400, "渠道代理选择无效")
+		return
+	}
+	proxy, err := s.m.ResolveLLMProxySelection(r.Context(), nil, channel.Proxy, channel.ProxyMode, channel.ProxyID)
+	if err != nil {
+		writeErr(w, 400, "代理解析失败")
+		return
+	}
+	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, proxy)
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType
@@ -1397,16 +1547,6 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if cfg.APIKey == "" {
-				cfg.APIKey = p.APIKey
-			}
-			if cfg.SessionHeaderKey == "" {
-				cfg.SessionHeaderKey = p.SessionHeaderKey
-			}
-		}
-	}
 	if cfg.APIKey == "" {
 		s.cfgMu.Lock()
 		cfg.APIKey = s.llmCfg.APIKey
@@ -1443,20 +1583,23 @@ func truncateReply(s string) string {
 }
 
 type createTaskReq struct {
-	Name                 string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
-	CategoryID           *int64   `json:"category_id,omitempty"`
-	Description          string   `json:"description"`
-	Goal                 string   `json:"goal"`
-	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
-	CompanyIDs           []int64  `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
-	TimeoutSeconds       int      `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
-	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
-	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
-	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	Name                 string                     `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
+	CategoryID           *int64                     `json:"category_id,omitempty"`
+	Description          string                     `json:"description"`
+	Goal                 string                     `json:"goal"`
+	LLMProfileID         *int64                     `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs        []int64                    `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
+	Members              []llmModelSelectionRequest `json:"members"`
+	SourceTaskIDs        []string                   `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
+	CompanyIDs           []int64                    `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	TimeoutSeconds       int                        `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
+	PlanHeartbeatSeconds int                        `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	SeedFirstIntent      *bool                      `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
+	CoverageEnabled      *bool                      `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	ProxyMode      db.TaskProxyMode       `json:"proxy_mode,omitempty"`
+	ProxyID        *int64                 `json:"proxy_id,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1471,7 +1614,11 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if len(req.LLMProfileIDs) == 0 && req.LLMProfileID != nil {
 		req.LLMProfileIDs = []int64{*req.LLMProfileID}
 	}
-	if err := s.validateTaskProfileIDs(req.LLMProfileIDs); err != nil {
+	members := modelSelectionRequests(req.Members)
+	if members != nil {
+		req.LLMProfileIDs = nil
+	}
+	if err := s.validateTaskModelMembers(members, req.LLMProfileIDs); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1510,12 +1657,17 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
-		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
+		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs, LLMMembers: members,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
 		InterceptRules:  interceptRules,
+		ProxyMode:       req.ProxyMode, ProxyID: req.ProxyID,
 	})
 	if err != nil {
+		if errors.Is(err, db.ErrProxyUnavailable) || errors.Is(err, db.ErrProxyIDRequired) || errors.Is(err, db.ErrProxyInvalidMode) || errors.Is(err, db.ErrLLMModelUnavailable) || errors.Is(err, db.ErrLLMModelInvalid) {
+			writeErr(w, 400, err.Error())
+			return
+		}
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
 			writeErr(w, 400, "任务分类不存在或无效")
 			return
@@ -1548,6 +1700,21 @@ func (s *Server) validateTaskProfileIDs(ids []int64) error {
 	return nil
 }
 
+func (s *Server) validateTaskModelMembers(members []db.LLMModelSelection, legacy []int64) error {
+	if members == nil {
+		return s.validateTaskProfileIDs(legacy)
+	}
+	if len(members) > 64 {
+		return db.ErrLLMModelInvalid
+	}
+	for _, selection := range members {
+		if _, _, ok := s.loadSelectionConfig(selection); !ok {
+			return db.ErrLLMModelUnavailable
+		}
+	}
+	return nil
+}
+
 func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.m.Task(r.PathValue("id"))
 	if !ok {
@@ -1557,15 +1724,19 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	// 任何生命周期状态(含终态)都可以改链:任务结束后主 Agent 对话仍走这条链,
 	// 模型不可用时不换链就等于把已完成任务的交互一起锁死。
 	before := t.llmStateSnapshot()
+	previousMember := t.activeLLMMember(before)
 	var req struct {
-		LLMProfileIDs      []int64 `json:"llm_profile_ids"`
-		ActiveLLMProfileID *int64  `json:"active_llm_profile_id"`
+		LLMProfileIDs      []int64                    `json:"llm_profile_ids"`
+		ActiveLLMProfileID *int64                     `json:"active_llm_profile_id"`
+		Members            []llmModelSelectionRequest `json:"members"`
+		ActivePosition     *int                       `json:"active_position"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if err := s.validateTaskProfileIDs(req.LLMProfileIDs); err != nil {
+	members := modelSelectionRequests(req.Members)
+	if err := s.validateTaskModelMembers(members, req.LLMProfileIDs); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1573,7 +1744,13 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	if req.ActiveLLMProfileID != nil {
 		active = *req.ActiveLLMProfileID
 	}
-	reopened, err := s.m.ReplaceTaskLLMProfiles(t.ID, req.LLMProfileIDs, active)
+	var reopened int64
+	var err error
+	if members != nil {
+		reopened, err = s.m.ReplaceTaskLLMMembers(t.ID, members, req.ActivePosition)
+	} else {
+		reopened, err = s.m.ReplaceTaskLLMProfiles(t.ID, req.LLMProfileIDs, active)
+	}
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -1586,12 +1763,14 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	go s.reconcileConcurrency()
 	llmState := t.llmStateSnapshot()
 	result := map[string]any{
+		"members": llmSelectionsDTO(llmState.Members), "active_position": llmState.ActivePosition, "active_member": t.activeLLMMember(llmState),
 		"id": t.ID, "llm_profile_ids": llmState.ProfileIDs,
 		"active_llm_profile_id": llmState.ActiveID,
 		"llm_failover_state":    llmState.FailoverState, "reopened_intents": reopened,
 	}
-	if !sameOptionalID(before.ActiveID, llmState.ActiveID) {
-		event := s.emitManualTaskLLMSwitch(t, before.ActiveID, llmState.ActiveID)
+	nextMember := t.activeLLMMember(llmState)
+	if !sameOptionalID(before.ActiveID, llmState.ActiveID) || !sameResolvedMember(previousMember, nextMember) {
+		event := s.emitManualTaskLLMSwitch(t, before.ActiveID, llmState.ActiveID, previousMember, nextMember)
 		result["switch_event"] = activityDTO(event)
 	}
 	writeJSON(w, 200, result)
@@ -3297,12 +3476,12 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_backend":       backend,
 		"brave_key_set":            strings.TrimSpace(braveKey) != "",
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
-		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
-		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
-		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
+		"web_search_proxy":         proxy,                           // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":             maskProxyURL(s.m.GlobalProxy()), // 兼容旧 UI 的脱敏回显；新 UI 使用代理编号
+		"python_interpreter":       strings.TrimSpace(pyStored),     // 用户/自动设的值(空=用运行时检测)
+		"workers":                  s.m.Workers(),                   // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"task_concurrency_enabled": concOn,                          // 任务并发上限开关(默认关)
+		"task_concurrency_limit":   concLimit,                       // 同时运行任务上限(开启后默认5)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3696,6 +3875,13 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, cancel := context.WithCancelCause(s.ctx)
+	ctx, finishOperation, admitted := s.engine.beginTaskOperationContext(ctx, t.ID)
+	if !admitted {
+		s.chatMu.Unlock()
+		cancel(agent.AbortTaskDeleted)
+		writeErr(w, 409, "任务操作无法准入")
+		return
+	}
 	ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: req.Message})
 	s.chatBusy[t.ID] = true
 	s.chatCancel[t.ID] = cancel
@@ -3723,7 +3909,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	s.engine.emitActivity(t, humanTurn)
 	var ma *agent.MainAgent
 	if s.taskRuntimeAvailable(t, "mainagent") {
-		ma = s.agentsForTask(t).main
+		bundle, err := s.agentsForTask(t, ctx)
+		if err != nil {
+			s.finishTaskChat(t.ID, cancel)
+			finishOperation()
+			writeErr(w, 503, "任务代理不可用，无法启动会话")
+			return
+		}
+		ma = bundle.main
 	}
 	if ma != nil {
 		// Run the agent on a per-turn cancellable ctx (NOT r.Context()): the turn can
@@ -3734,6 +3927,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer func() {
 				s.finishTaskChat(t.ID, cancel)
+				finishOperation()
 			}()
 			// emit every step (thinking/tool_use/tool_result/text/result) so the main
 			// agent session shows its work live, like worker/planner. The final answer
@@ -3761,6 +3955,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	reply := s.fallbackChat(t, req.Message)
 	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
 	s.finishTaskChat(t.ID, cancel)
+	finishOperation()
 	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule"})
 }
 
