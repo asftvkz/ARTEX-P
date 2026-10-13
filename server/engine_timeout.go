@@ -67,9 +67,16 @@ func (e *Engine) beginTaskOperation(taskID string) bool {
 		if err != nil {
 			return false
 		}
-		if err = e.m.pg.AcquireTaskProxyActivity(id); err != nil {
+		state, err := e.m.pg.AcquireTaskOperation(id)
+		if err != nil {
 			log.Printf("[proxy] 任务 %s 操作准入失败: %v", taskID, err)
 			return false
+		}
+		if task, ok := e.m.Task(taskID); ok {
+			if err = e.m.refreshTaskProxyState(task, state); err != nil {
+				_ = e.m.pg.ReleaseTaskOperation(id)
+				return false
+			}
 		}
 	}
 	atomic.AddInt64(e.inflightCounter(taskID), 1)
@@ -82,7 +89,7 @@ func (e *Engine) decInflight(taskID string) {
 	if e.m != nil && e.m.pg != nil {
 		id, err := strconv.ParseInt(taskID, 10, 64)
 		if err == nil {
-			if err = e.m.pg.ReleaseTaskProxyActivity(id); err != nil {
+			if err = e.m.pg.ReleaseTaskOperation(id); err != nil {
 				log.Printf("[proxy] 任务 %s 操作占用解除失败: %v", taskID, err)
 			}
 		}

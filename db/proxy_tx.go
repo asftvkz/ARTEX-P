@@ -20,7 +20,7 @@ func lockProxyLifecycle(tx *sql.Tx) error {
 
 // EnsureProxyActivitySchema 在代理运行时启动时调用；异常退出遗留的占用不自动清零。
 func (d *DB) EnsureProxyActivitySchema() error {
-	return d.withProxyLifecycle(func(tx *sql.Tx) error {
+	if err := d.withProxyLifecycle(func(tx *sql.Tx) error {
 		_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS task_proxy_activity (
 task_id bigint PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
 proxy_id bigint NOT NULL REFERENCES outbound_proxies(id) ON DELETE RESTRICT,
@@ -30,7 +30,10 @@ exclusive_release boolean NOT NULL DEFAULT false
 ALTER TABLE task_proxy_activity ADD COLUMN IF NOT EXISTS exclusive_release boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS task_proxy_activity_proxy_idx ON task_proxy_activity(proxy_id);`)
 		return err
-	})
+	}); err != nil {
+		return err
+	}
+	return d.MigrateTaskProxySwitch()
 }
 
 // AcquireTaskProxyActivity 与停删改共锁，从已提交的绑定和快照取得真实出口。
@@ -49,81 +52,96 @@ func (d *DB) acquireTaskProxyActivity(taskID int64, requireIdle bool) error {
 		return ErrProxyUnavailable
 	}
 	return d.withProxyLifecycle(func(tx *sql.Tx) error {
-		var mode TaskProxyMode
-		var bound sql.NullInt64
-		var raw []byte
-		var present bool
-		if err := tx.QueryRow(`SELECT COALESCE(proxy_mode,'inherit'),proxy_id,COALESCE(proxy_snapshot,'{}'::jsonb),deleted_at IS NULL FROM tasks WHERE id=$1`, taskID).Scan(&mode, &bound, &raw, &present); err != nil {
-			return err
-		}
-		if !present {
+		return acquireTaskProxyActivityTx(tx, taskID, requireIdle)
+	})
+}
+
+func acquireTaskProxyActivityTx(tx *sql.Tx, taskID int64, requireIdle bool) error {
+	var blocked bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM task_operation_activity WHERE task_id=$1 AND (switch_token<>'' OR ($2 AND active_count>0)))`, taskID, requireIdle).Scan(&blocked); err != nil {
+		return err
+	}
+	if blocked {
+		return ErrProxyInUse
+	}
+	var mode TaskProxyMode
+	var bound sql.NullInt64
+	var raw []byte
+	var present bool
+	if err := tx.QueryRow(`SELECT COALESCE(proxy_mode,'inherit'),proxy_id,COALESCE(proxy_snapshot,'{}'::jsonb),deleted_at IS NULL FROM tasks WHERE id=$1`, taskID).Scan(&mode, &bound, &raw, &present); err != nil {
+		return err
+	}
+	if !present {
+		return ErrProxyUnavailable
+	}
+	normalized, err := NormalizeTaskProxyMode(mode)
+	if err != nil {
+		return err
+	}
+	if normalized == TaskProxyModeDirect {
+		return nil
+	}
+	var snapshot ProxySnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return ErrProxyUnavailable
+	}
+	id := snapshot.ID
+	if bound.Valid {
+		if id != 0 && id != bound.Int64 {
 			return ErrProxyUnavailable
 		}
-		normalized, err := NormalizeTaskProxyMode(mode)
-		if err != nil {
-			return err
-		}
-		if normalized == TaskProxyModeDirect {
-			return nil
-		}
-		var snapshot ProxySnapshot
-		if err := json.Unmarshal(raw, &snapshot); err != nil {
-			return ErrProxyUnavailable
-		}
-		id := snapshot.ID
-		if bound.Valid {
-			if id != 0 && id != bound.Int64 {
-				return ErrProxyUnavailable
-			}
-			id = bound.Int64
-		}
-		if id == 0 && normalized == TaskProxyModeInherit {
-			return nil
-		}
-		// 回收独占标记也约束其他 Manager；普通引用仍可合法并发累加。
-		var busy bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM task_proxy_activity WHERE task_id=$1 AND (exclusive_release OR ($2 AND active_count>0)))`, taskID, requireIdle).Scan(&busy); err != nil {
-			return err
-		}
-		if busy {
-			return ErrProxyInUse
-		}
-		p, err := getProxyTx(tx, id)
-		if err != nil {
-			return err
-		}
-		if err := usableProxy(p); err != nil {
-			return err
-		}
-		result, err := tx.Exec(`INSERT INTO task_proxy_activity(task_id,proxy_id,active_count,exclusive_release) VALUES($1,$2,1,$3)
+		id = bound.Int64
+	}
+	if id == 0 && normalized == TaskProxyModeInherit {
+		return nil
+	}
+	// 回收独占标记也约束其他 Manager；普通引用仍可合法并发累加。
+	var busy bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM task_proxy_activity WHERE task_id=$1 AND (exclusive_release OR ($2 AND active_count>0)))`, taskID, requireIdle).Scan(&busy); err != nil {
+		return err
+	}
+	if busy {
+		return ErrProxyInUse
+	}
+	p, err := getProxyTx(tx, id)
+	if err != nil {
+		return err
+	}
+	if err := usableProxy(p); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`INSERT INTO task_proxy_activity(task_id,proxy_id,active_count,exclusive_release) VALUES($1,$2,1,$3)
 ON CONFLICT(task_id) DO UPDATE SET active_count=task_proxy_activity.active_count+1
 WHERE task_proxy_activity.proxy_id=EXCLUDED.proxy_id
 AND NOT task_proxy_activity.exclusive_release AND NOT EXCLUDED.exclusive_release`, taskID, id, requireIdle)
-		if err != nil {
-			return err
-		}
-		n, err := result.RowsAffected()
-		if err == nil && n != 1 {
-			return ErrProxyUnavailable
-		}
+	if err != nil {
 		return err
-	})
+	}
+	n, err := result.RowsAffected()
+	if err == nil && n != 1 {
+		return ErrProxyUnavailable
+	}
+	return err
 }
 
 // ReleaseTaskProxyActivity 仅在真实操作退出后调用；context 取消不能提前解除占用。
 func (d *DB) ReleaseTaskProxyActivity(taskID int64) error {
 	return d.withProxyLifecycle(func(tx *sql.Tx) error {
-		result, err := tx.Exec(`DELETE FROM task_proxy_activity WHERE task_id=$1 AND active_count=1`, taskID)
-		if err != nil {
-			return err
-		}
-		n, err := result.RowsAffected()
-		if err != nil || n != 0 {
-			return err
-		}
-		_, err = tx.Exec(`UPDATE task_proxy_activity SET active_count=active_count-1 WHERE task_id=$1 AND active_count>1`, taskID)
-		return err
+		return releaseTaskProxyActivityTx(tx, taskID)
 	})
+}
+
+func releaseTaskProxyActivityTx(tx *sql.Tx, taskID int64) error {
+	result, err := tx.Exec(`DELETE FROM task_proxy_activity WHERE task_id=$1 AND active_count=1`, taskID)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 0 {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE task_proxy_activity SET active_count=active_count-1 WHERE task_id=$1 AND active_count>1`, taskID)
+	return err
 }
 
 // WithIdleProxy 在任务快照的同一事务锁内执行运行器生命周期操作。
@@ -295,7 +313,8 @@ func getProxyTx(tx *sql.Tx, id int64) (*Proxy, error) {
 func proxyInUseTx(tx *sql.Tx, id int64) (bool, error) {
 	var used bool
 	err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE proxy_id=$1 AND deleted_at IS NULL AND status NOT IN ('done','failed','timeout'))
-OR EXISTS(SELECT 1 FROM task_proxy_activity WHERE proxy_id=$1 AND active_count>0)`, id).Scan(&used)
+OR EXISTS(SELECT 1 FROM task_proxy_activity WHERE proxy_id=$1 AND active_count>0)
+OR EXISTS(SELECT 1 FROM task_operation_activity a JOIN tasks t ON t.id=a.task_id WHERE a.switch_token<>'' AND (a.target_id=$1 OR t.proxy_id=$1))`, id).Scan(&used)
 	return used, err
 }
 

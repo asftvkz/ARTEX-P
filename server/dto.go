@@ -66,6 +66,7 @@ type TaskDTO struct {
 	CompanyIDs         []int64                `json:"company_ids"`
 	CoverageEnabled    bool                   `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
 	ProxyMode          db.TaskProxyMode       `json:"proxy_mode"`
+	ProxyRevision      int64                  `json:"proxy_revision"`
 	ProxyID            *int64                 `json:"proxy_id,omitempty"`
 	Proxy              *ProxyDTO              `json:"proxy,omitempty"`
 }
@@ -206,7 +207,11 @@ func tokenTotalDTO(u db.TokenUsage) TokenTotalDTO {
 	}
 }
 
-func taskDTO(t *Task, status string) TaskDTO {
+func taskDTO(t *Task, status string, selections ...db.TaskProxyState) TaskDTO {
+	proxy := t.proxyState()
+	if len(selections) > 0 {
+		proxy = selections[0]
+	}
 	lifecycle := t.lifecycleSnapshot()
 	llmState := t.llmStateSnapshot()
 	sourceIDs := make([]string, 0, len(lifecycle.SourceTaskIDs))
@@ -240,9 +245,10 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
-		ProxyMode:          t.ProxyMode,
-		ProxyID:            t.ProxyID,
-		Proxy:              proxySnapshotDTO(t.ProxySnapshot),
+		ProxyMode:          proxy.Mode,
+		ProxyID:            proxy.ID,
+		Proxy:              proxySnapshotDTO(proxy.Snapshot),
+		ProxyRevision:      proxy.Revision,
 	}
 }
 

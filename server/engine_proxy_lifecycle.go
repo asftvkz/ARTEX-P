@@ -105,12 +105,17 @@ func (m *Manager) releaseTaskProxyOccupied(ctx context.Context, t *Task) error {
 	if err != nil {
 		return err
 	}
+	executor, err := m.pg.AcquireTaskProxySwitchExecutor(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
 	if m.pg != nil {
-		if err := m.pg.AcquireIdleTaskProxyActivity(id); err != nil {
+		if err := executor.AcquireIdleTaskProxyActivity(); err != nil {
 			return err
 		}
 		defer func() {
-			if err := m.pg.ReleaseTaskProxyActivity(id); err != nil {
+			if err := executor.ReleaseTaskProxyActivity(); err != nil {
 				log.Printf("[proxy] 回收占用解除失败: %v", err)
 			}
 		}()

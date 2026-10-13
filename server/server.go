@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -776,6 +777,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/update/stream", s.updateStream)
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
+	s.registerTaskProxyRoutes(mux)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
 	mux.HandleFunc("GET /api/task-categories", s.pgListTaskCategories)
 	mux.HandleFunc("POST /api/task-categories", s.pgCreateTaskCategory)
@@ -1150,11 +1152,17 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		active = t.ID
 	}
 	list := s.m.List()
+	proxyStates, err := s.m.pg.ListTaskProxyStates()
+	if err != nil {
+		writeErr(w, 503, "任务代理状态暂不可读取")
+		return
+	}
 	metrics, _ := s.m.PG().TaskListMetricsAll()
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
-		dto := taskDTO(t, s.resolvedTaskStatus(t))
+		n, _ := strconv.ParseInt(t.ID, 10, 64)
+		dto := taskDTO(t, s.resolvedTaskStatus(t), proxyStates[n])
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
 		metric := metrics[t.ExpID]
 		dto.Tokens = tokenTotalDTO(metric.Tokens)
@@ -1911,7 +1919,21 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	n, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	row, err := s.m.pg.GetTask(n)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && row == nil) {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	if err != nil {
+		writeErr(w, 503, "任务代理状态暂不可读取")
+		return
+	}
+	dto := taskDTO(t, s.resolvedTaskStatus(t), db.TaskProxyState{Mode: row.ProxyMode, ID: row.ProxyID, Snapshot: row.ProxySnapshot, Revision: row.ProxyRevision})
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)
