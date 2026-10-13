@@ -483,7 +483,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		_ = pg.Close()
 		return nil, fmt.Errorf("迁移旧全局代理: %w", err)
 	}
-	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
+	m.enrich = enrich.New(m.assets, m.taskEnrichRoute, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()
@@ -830,6 +830,7 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	m.enrich.Close()
 	runtimeErr := m.CloseProxyRuntime()
 	m.mu.Lock()
 	defer m.mu.Unlock()
