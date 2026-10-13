@@ -363,6 +363,16 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					}
 					_ = t.as.AddAutoScope(taskID, typ, item.Domain, item.URL, svcIP)
 				}
+				if t.enrich != nil {
+					switch typ {
+					case "root_domain", "subdomain":
+						t.enrich.ResolveDomain(id, item.Domain)
+					case "service":
+						if item.URL != "" {
+							t.enrich.ProbeSite(id, item.URL)
+						}
+					}
+				}
 			}
 
 			return jsonResult(map[string]any{
