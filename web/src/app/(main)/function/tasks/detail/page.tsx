@@ -5,20 +5,12 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import {
-  ArchiveIcon,
-  ArrowLeftIcon,
-  BrainIcon,
-  CheckIcon,
-  CircleAlertIcon,
-  PauseIcon,
-  PlayIcon,
-  RadioTowerIcon,
-} from "lucide-react";
+import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { ChannelModelChain } from "@/components/llm-selection";
 import { StatusBadge } from "@/components/status-badge";
+import { TaskProxyControl } from "@/components/task-proxy-control";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -57,7 +49,6 @@ import {
   selectionsFromTaskWithReport,
   validationErrorFromDropped,
 } from "@/lib/llm-selection";
-import { proxyEndpoint, taskProxyLabel } from "@/lib/proxy-center";
 import type { LLMModel, LLMProfile, LLMSelection, Task } from "@/lib/types";
 
 import { AssetsTab } from "./_tabs/assets-tab";
@@ -304,12 +295,23 @@ function TaskDetailInner() {
   }, [id]);
 
   const taskLoadInFlight = React.useRef<string | null>(null);
+  const taskLoadRevision = React.useRef(0);
+  const invalidateTaskLoad = React.useCallback(() => {
+    taskLoadRevision.current++;
+  }, []);
+  const applyProxyTask = React.useCallback((latest: Task) => {
+    // 代理保存后的权威 GET 必须覆盖轮询缓存；保存前开始的迟到轮询不能再覆盖它。
+    taskLoadRevision.current++;
+    setTask(latest);
+    setPaused(latest.paused ?? latest.status === "paused");
+  }, []);
   const load = React.useCallback(() => {
     if (taskLoadInFlight.current === id) return;
     taskLoadInFlight.current = id;
+    const revision = taskLoadRevision.current;
     Promise.all([api.task(id), api.stats(id).catch(() => null)])
       .then(([task, s]) => {
-        if (taskLoadInFlight.current !== id) return;
+        if (taskLoadInFlight.current !== id || taskLoadRevision.current !== revision) return;
         const base = { ...task };
         const at = s?.active_task;
         if (at) {
@@ -429,41 +431,7 @@ function TaskDetailInner() {
           </code>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
           <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button size="sm" variant="outline" title="任务代理快照" aria-label="查看任务代理快照">
-                <RadioTowerIcon data-icon="inline-start" />
-                <span className="hidden lg:inline">{taskProxyLabel(task)}</span>
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent align="end" className="w-[min(24rem,calc(100vw-2rem))] gap-3 p-4">
-              <PopoverHeader>
-                <PopoverTitle>任务代理快照</PopoverTitle>
-                <PopoverDescription>创建时保存的出口，同时用于任务工具和任务 LLM 请求。</PopoverDescription>
-              </PopoverHeader>
-              <p className="text-sm">
-                选择方式：
-                {task.proxy_mode
-                  ? { inherit: "继承全局默认", direct: "明确直连", fixed: "指定编号" }[task.proxy_mode]
-                  : "旧任务未记录"}
-              </p>
-              {task.proxy ? (
-                <div className="space-y-2 text-sm">
-                  <p>
-                    编号：#{task.proxy.id} · {task.proxy.name}
-                  </p>
-                  <p>类型：{task.proxy.kind}</p>
-                  <p className="break-all font-mono text-xs">出口：{proxyEndpoint(task.proxy)}</p>
-                  {task.proxy.resin_platform && <p>Platform：{task.proxy.resin_platform}</p>}
-                </div>
-              ) : (
-                <p className="text-sm">{taskProxyLabel(task)}</p>
-              )}
-              <p className="text-muted-foreground text-xs">
-                全局默认或代理记录后续变更不会改写此快照；当前健康状态请到代理中心检测。
-              </p>
-            </PopoverContent>
-          </Popover>
+          <TaskProxyControl key={task.id} task={task} onSaving={invalidateTaskLoad} onUpdated={applyProxyTask} />
           <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
           {canArchive ? (
             <AlertDialog>

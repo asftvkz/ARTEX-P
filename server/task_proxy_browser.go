@@ -12,6 +12,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
+	browserruntime "github.com/Autumn-27/artex/runtime/playwright"
 )
 
 // TaskMCPConfig 只克隆本次运行配置，绝不保存到共享 MCP 记录。
@@ -115,8 +116,22 @@ func taskBrowserConfig(dir string, id int64, original *db.MCPServer, addr, ca st
 	}
 	browser := object(config, "browser")
 	launch := object(browser, "launchOptions")
+	if os.Getenv("ARTEX_PLAYWRIGHT_ROOT") != "" {
+		executable, err := browserruntime.Executable(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		browser["browserName"] = "chromium"
+		launch["executablePath"] = executable
+		launch["headless"] = true
+		if os.Geteuid() == 0 {
+			launch["chromiumSandbox"] = false
+		}
+		delete(launch, "channel")
+	}
 	delete(launch, "proxy")
 	delete(object(browser, "contextOptions"), "proxy")
+	delete(object(browser, "contextOptions"), "ignoreHTTPSErrors")
 	var launchArgs []string
 	if old, ok := launch["args"].([]any); ok {
 		for _, v := range old {

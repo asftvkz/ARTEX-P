@@ -85,6 +85,9 @@ func (m *Manager) InitProxyRuntime(ctx context.Context) error {
 	if err := m.pg.EnsureProxyActivitySchema(); err != nil {
 		return err
 	}
+	if err := m.pg.MigrateTaskProxySwitch(); err != nil {
+		return err
+	}
 	if err := m.pg.MigrateLegacyProxy(); err != nil {
 		return err
 	}
@@ -136,28 +139,29 @@ func snapshotProxyURL(s db.ProxySnapshot, taskID string) string {
 }
 
 func (m *Manager) runtimeSnapshot(t *Task) (db.ProxySnapshot, error) {
+	state := t.proxyState()
 	if t != nil {
-		if _, err := db.NormalizeTaskProxyMode(t.ProxyMode); err != nil {
+		if _, err := db.NormalizeTaskProxyMode(state.Mode); err != nil {
 			return db.ProxySnapshot{}, err
 		}
 	}
-	if t == nil || t.ProxyMode == db.TaskProxyModeDirect {
+	if t == nil || state.Mode == db.TaskProxyModeDirect {
 		return db.ProxySnapshot{}, nil
 	}
-	if t.ProxySnapshot.ID == 0 {
-		if t.ProxyMode == db.TaskProxyModeFixed || t.ProxyID != nil {
+	if state.Snapshot.ID == 0 {
+		if state.Mode == db.TaskProxyModeFixed || state.ID != nil {
 			return db.ProxySnapshot{}, db.ErrProxyUnavailable
 		}
 		return db.ProxySnapshot{}, nil
 	}
-	p, err := m.pg.GetProxy(t.ProxySnapshot.ID)
+	p, err := m.pg.GetProxy(state.Snapshot.ID)
 	if err != nil {
 		return db.ProxySnapshot{}, db.ErrProxyUnavailable
 	}
 	if _, err = usableTaskProxy(p); err != nil {
 		return db.ProxySnapshot{}, err
 	}
-	s, err := m.pg.ResolveProxySnapshot(t.ProxySnapshot)
+	s, err := m.pg.ResolveProxySnapshot(state.Snapshot)
 	if err != nil {
 		return db.ProxySnapshot{}, errors.New("任务代理快照解密失败")
 	}
@@ -227,13 +231,35 @@ func (m *Manager) TaskToolProxy(ctx context.Context, t *Task) (addr, ca string, 
 		}
 		return route.ProxyAddr(), m.traffic.CACertPath(), nil
 	}
+	// Chromium 不支持 SOCKS 账号认证；工具统一使用任务独立认证桥，仍固定原出口。
+	if t != nil && addr != "" {
+		u, parseErr := egress.ProxyURL(addr)
+		if parseErr != nil {
+			return "", "", parseErr
+		}
+		if u.Scheme == "socks5" || u.Scheme == "https" {
+			rt.mu.Lock()
+			bridge := rt.bridges[t.ID]
+			if bridge == nil {
+				bridge, err = egress.NewHTTPBridge(addr)
+				if err == nil {
+					rt.bridges[t.ID] = bridge
+				}
+			}
+			rt.mu.Unlock()
+			if err != nil {
+				return "", "", err
+			}
+			addr = bridge.ProxyAddr()
+		}
+	}
 	return addr, "", nil
 }
 
 // ResolveLLMProxySelection 只在可信运行边界解析渠道中心引用，不把凭据写回渠道。
 func (m *Manager) ResolveLLMProxySelection(ctx context.Context, t *Task, legacyURL, mode string, proxyID *int64) (string, error) {
 	if t != nil {
-		taskMode, err := db.NormalizeTaskProxyMode(t.ProxyMode)
+		taskMode, err := db.NormalizeTaskProxyMode(t.proxyState().Mode)
 		if err != nil {
 			return "", err
 		}
@@ -284,14 +310,14 @@ func (m *Manager) ResolveLLMProxySelection(ctx context.Context, t *Task, legacyU
 // ResolveLLMProxy 固定/直连覆盖渠道；继承使用创建快照，非任务继承当前全局。
 func (m *Manager) ResolveLLMProxy(ctx context.Context, t *Task, channelProxy string) (string, error) {
 	if t != nil {
-		if _, err := db.NormalizeTaskProxyMode(t.ProxyMode); err != nil {
+		if _, err := db.NormalizeTaskProxyMode(t.proxyState().Mode); err != nil {
 			return "", err
 		}
 	}
-	if t != nil && t.ProxyMode == db.TaskProxyModeDirect {
+	if t != nil && t.proxyState().Mode == db.TaskProxyModeDirect {
 		return "", nil
 	}
-	if (t == nil || t.ProxyMode != db.TaskProxyModeFixed) && strings.TrimSpace(channelProxy) != "" {
+	if (t == nil || t.proxyState().Mode != db.TaskProxyModeFixed) && strings.TrimSpace(channelProxy) != "" {
 		if _, err := egress.ProxyURL(channelProxy); err != nil {
 			return "", err
 		}
@@ -380,6 +406,9 @@ func (m *Manager) prepareResinLease(ctx context.Context, rt *proxyRuntimeState, 
 			return errors.New("Resin 租约状态不明确，拒绝自动重新使用")
 		}
 		if record.State == "active" {
+			if record.Snapshot.ID != s.ID {
+				return errors.New("旧 Resin 租约尚未回收，拒绝替换身份")
+			}
 			return nil
 		}
 		if record.State != "released" {
@@ -401,7 +430,7 @@ func (m *Manager) prepareResinLease(ctx context.Context, rt *proxyRuntimeState, 
 	if err = resinConfig(p).Probe(ctx); err != nil {
 		return err
 	}
-	return writeLease(path, resinLeaseRecord{State: "active", Snapshot: t.ProxySnapshot, AdminURL: p.ResinAdminURL})
+	return writeLease(path, resinLeaseRecord{State: "active", Snapshot: t.proxyState().Snapshot, AdminURL: p.ResinAdminURL})
 }
 
 // ReleaseTaskProxy 持久化回收意图；不明确结果保留材料，禁止自动重复回收。
@@ -427,7 +456,8 @@ func (m *Manager) ReleaseTaskProxy(ctx context.Context, t *Task) error {
 	if bridge != nil {
 		_ = bridge.Close()
 	}
-	if t.ProxySnapshot.Kind != db.ProxyKindResin {
+	state := t.proxyState()
+	if state.Snapshot.Kind != db.ProxyKindResin {
 		return nil
 	}
 	path, err := leasePath(rt, t.ID)
@@ -444,6 +474,9 @@ func (m *Manager) ReleaseTaskProxy(ctx context.Context, t *Task) error {
 	var record resinLeaseRecord
 	if json.Unmarshal(b, &record) != nil {
 		return errors.New("Resin 租约记录无效")
+	}
+	if record.Snapshot.ID != state.Snapshot.ID {
+		return errors.New("Resin 租约身份与旧出口不一致")
 	}
 	if record.State == "released" {
 		return nil

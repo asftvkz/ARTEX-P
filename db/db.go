@@ -169,12 +169,22 @@ func Open(dsn string) (*DB, error) {
 		if err := d.MigrateWarpCreateRequests(context.Background()); err != nil {
 			return fmt.Errorf("migrate WARP create requests: %w", err)
 		}
+		if err := d.EnsureProxyActivitySchema(); err != nil {
+			return fmt.Errorf("migrate task proxy switch: %w", err)
+		}
+		if err := d.MigrateProxyCreateIntents(context.Background()); err != nil {
+			return fmt.Errorf("migrate proxy create intents: %w", err)
+		}
 		if err := d.seedBuiltins(); err != nil {
 			return fmt.Errorf("seed builtins: %w", err)
 		}
 		return nil
 	})
 	if err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	if err := d.initTaskOperationLockPool(dsn); err != nil {
 		sqlDB.Close()
 		return nil, err
 	}

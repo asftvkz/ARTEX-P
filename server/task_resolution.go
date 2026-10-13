@@ -65,10 +65,13 @@ func (s *Server) resolutionFromSelection(p *db.LLMProfile, selection db.LLMModel
 		return result
 	}
 	if task := firstTask(tasks); task != nil {
-		if task.ProxyMode == db.TaskProxyModeDirect {
+		proxyState := task.proxyState()
+		if proxyState.Mode == db.TaskProxyModeDirect {
 			cfg.Proxy = ""
-		} else if task.ProxyMode == db.TaskProxyModeFixed || cfg.Proxy == "" {
-			snapshot, err := s.m.runtimeSnapshot(task)
+		} else if proxyState.Mode == db.TaskProxyModeFixed || cfg.Proxy == "" {
+			taskCopy := &Task{ID: task.ID}
+			taskCopy.setProxyState(proxyState)
+			snapshot, err := s.m.runtimeSnapshot(taskCopy)
 			if err != nil {
 				result.Reason = "任务代理不可用"
 				return result

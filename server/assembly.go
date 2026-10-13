@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -83,8 +85,24 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 				if !directVisible && !skillGated {
 					continue // neither directly visible nor referenced by a visible skill
 				}
+				// 兼容既有默认 npx 配置，运行时使用本次程序随附的固定包，不覆写用户数据库配置。
+				if m.Name == browserMCPName && m.Transport == "stdio" && m.Command == "npx" && os.Getenv("ARTEX_PLAYWRIGHT_ROOT") != "" {
+					args := jsonStrSlice(m.Args)
+					if len(args) > 0 && (args[0] == "@playwright/mcp" || args[0] == "@playwright/mcp@latest") {
+						copy := *m
+						copy.Command = "playwright-mcp"
+						copy.Args, _ = json.Marshal(args[1:])
+						m = &copy
+					}
+				}
 				if len(managers) > 0 {
-					resolved, err := managers[0].TaskMCPConfig(ctx, m)
+					var resolved *db.MCPServer
+					var err error
+					if agent.RunInfoFrom(ctx).TaskID > 0 {
+						resolved, err = managers[0].TaskMCPConfig(ctx, m)
+					} else {
+						resolved, err = managedBrowserConfig(m)
+					}
 					if err != nil {
 						// 只返回明确错误工具，绝不启动未解析的共享浏览器配置。
 						for _, closer := range closers {
@@ -192,6 +210,22 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 	}
 }
 
+func managedBrowserConfig(original *db.MCPServer) (*db.MCPServer, error) {
+	if original == nil || original.Name != browserMCPName || os.Getenv("ARTEX_PLAYWRIGHT_ROOT") == "" {
+		return original, nil
+	}
+	copy := *original
+	if copy.Transport != "stdio" {
+		return nil, errors.New("浏览器运行时要求独立 stdio")
+	}
+	args := jsonStrSlice(copy.Args)
+	if copy.Command == "npx" && len(args) > 0 && (args[0] == "@playwright/mcp" || args[0] == "@playwright/mcp@latest") {
+		copy.Command = "playwright-mcp"
+		copy.Args, _ = json.Marshal(args[1:])
+	}
+	return taskBrowserConfig(os.TempDir(), 0, &copy, "", "")
+}
+
 func idSet(ids []int64) map[int64]bool {
 	m := make(map[int64]bool, len(ids))
 	for _, id := range ids {
@@ -253,7 +287,13 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		rows, err := pg.ListTools()
 		if err != nil {
 			log.Printf("[tools] 读取工具表失败，按代码默认放行: %v", err)
-			return tools
+			out := tools[:0:0]
+			for _, tool := range tools {
+				if !isProxyCenterTool(tool.Name()) {
+					out = append(out, tool)
+				}
+			}
+			return out
 		}
 		byKey := make(map[string]*db.Tool, len(rows))
 		for _, t := range rows {
@@ -265,16 +305,23 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			if len(row.Schema) > 0 {
 				_ = json.Unmarshal(row.Schema, &schema)
 			}
-			return meterTool(agent.DecorateTool(t, row.Description, schema), pg, row.Key, agentKey, runInfo)
+			resolved := meterTool(agent.DecorateTool(t, row.Description, schema), pg, row.Key, agentKey, runInfo)
+			if isProxyCenterTool(t.Name()) {
+				return &authorizedProxyTool{CoreTool: resolved, pg: pg, agentKey: agentKey, schema: t.InputSchema()}
+			}
+			return resolved
 		}
 		out := tools[:0:0]
 		for _, t := range tools {
 			row, known := byKey[t.Name()]
 			if !known { // MCP/skill/host tool: no row → untouched
+				if isProxyCenterTool(t.Name()) {
+					continue
+				}
 				out = append(out, t)
 				continue
 			}
-			if !row.Enabled || !contains(row.Agents, agentKey) {
+			if !row.Enabled || !contains(row.Agents, agentKey) || (isProxyCenterTool(t.Name()) && !row.System) {
 				continue // disabled globally or not bound to this agent → drop
 			}
 			out = append(out, resolve(t, row))

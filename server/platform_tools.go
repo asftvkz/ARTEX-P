@@ -16,7 +16,7 @@ import (
 // seed 进 tools 表、默认绑定 auto,经 hostTools 注入。复用现有 db/文件系统逻辑。
 
 func (s *Server) platformTools() []actool.CoreTool {
-	return []actool.CoreTool{
+	return append([]actool.CoreTool{
 		s.toolCreateSkill(),
 		s.toolUpdateSkillFile(),
 		s.toolCreateCustomTool(),
@@ -24,10 +24,10 @@ func (s *Server) platformTools() []actool.CoreTool {
 		s.toolCreateMCP(),
 		s.toolUpdateMCP(),
 		s.toolDeleteAssetsByHost(),
-	}
+	}, s.proxyCenterTools()...)
 }
 
-// platformToolKeys are the tool keys the Auto agent gets bound by default.
+// 旧工具补绑迁移列表。代理工具仅由 SeedTool 首次绑定，不能加入旧补绑迁移。
 var platformToolKeys = []string{
 	"create_skill", "update_skill_file",
 	"create_custom_tool", "update_custom_tool",

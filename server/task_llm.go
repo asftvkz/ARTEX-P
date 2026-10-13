@@ -23,6 +23,7 @@ import (
 type taskAgentBundle struct {
 	proxyAddr      string
 	proxyCA        string
+	proxyRevision  int64
 	runtime        *taskLLMRuntime // goal decomposition runtime
 	plannerRuntime *taskLLMRuntime
 	workerRuntime  *taskLLMRuntime
@@ -753,7 +754,8 @@ func (s *Server) agentsForTask(t *Task, contexts ...context.Context) (*taskAgent
 	if s.taskAgents == nil {
 		s.taskAgents = map[string]*taskAgentBundle{}
 	}
-	if bundle := s.taskAgents[t.ID]; bundle != nil && bundle.proxyAddr == proxyAddr && bundle.proxyCA == proxyCA {
+	proxyRevision := t.proxyState().Revision
+	if bundle := s.taskAgents[t.ID]; bundle != nil && bundle.proxyAddr == proxyAddr && bundle.proxyCA == proxyCA && bundle.proxyRevision == proxyRevision {
 		return bundle, nil
 	}
 	goalRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "goals"}
@@ -800,7 +802,7 @@ func (s *Server) agentsForTask(t *Task, contexts ...context.Context) (*taskAgent
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{
-		proxyAddr: proxyAddr, proxyCA: proxyCA,
+		proxyAddr: proxyAddr, proxyCA: proxyCA, proxyRevision: proxyRevision,
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
 	}

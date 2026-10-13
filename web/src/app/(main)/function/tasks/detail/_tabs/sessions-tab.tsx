@@ -31,6 +31,7 @@ import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/
 import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
+import { TaskFollowupComposer } from "@/components/task-followup-composer";
 import { Transcript } from "@/components/transcript";
 import {
   AlertDialog,
@@ -2092,6 +2093,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                   </InputGroupAddon>
                 </InputGroup>
               </div>
+            ) : active.role === "worker" && active.intent_id &&
+              ["done", "blocked", "exhausted", "stopped"].includes(active.status) ? (
+              <TaskFollowupComposer key={active.id} taskId={taskId} intentId={Number(active.intent_id)} mainSeg={currentSeg}
+                onSent={() => setActiveId(mainSessionId(currentSeg))} />
             ) : (
               <div className="flex items-center border-t px-4 py-2">
                 <TodoPopover

@@ -13,5 +13,8 @@ func TestTaskProxyEnvironmentClearsBypassAndDirect(t *testing.T) {
 				t.Fatalf("缺少环境覆盖 %s", key)
 			}
 		}
+		if !strings.Contains(env, "ARTEX_PLAYWRIGHT_MANAGED=1") || !strings.Contains(env, "ARTEX_PLAYWRIGHT_PROXY="+addr) {
+			t.Fatal("浏览器未接入正式任务出口")
+		}
 	}
 }

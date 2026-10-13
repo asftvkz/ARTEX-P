@@ -228,11 +228,12 @@ func proxyEnv(proxyAddr, caCert string) []string {
 
 // taskProxyEnv 同时支持明确直连：清除宿主进程的代理环境。
 func taskProxyEnv(addr, ca string, strict bool) []string {
+	browser := []string{"ARTEX_PLAYWRIGHT_MANAGED=1", "ARTEX_PLAYWRIGHT_PROXY=" + addr, "ARTEX_PLAYWRIGHT_CA=" + ca}
 	if addr != "" {
-		return proxyEnv(addr, ca)
+		return append(proxyEnv(addr, ca), browser...)
 	}
 	if strict {
-		return []string{"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=", "NO_PROXY=", "no_proxy="}
+		return append([]string{"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=", "NO_PROXY=", "no_proxy="}, browser...)
 	}
 	return nil
 }
@@ -512,6 +513,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
 	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
 	ctx = attachSideCapture(ctx, &opts)
+	opts.BashEnv = browserRunEnvironment(opts.BashEnv)
+	defer closeRunBrowser(ctx, opts.WorkingDir, opts.BashEnv)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
 

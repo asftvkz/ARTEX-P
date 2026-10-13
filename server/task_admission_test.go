@@ -545,9 +545,12 @@ func TestTaskLLMResolutionRejectsInvalidExplicitProfile(t *testing.T) {
 		Format: "openai",
 		Model:  "invalid-model",
 		APIKey: "test-key",
-		Proxy:  "invalid-proxy-without-scheme",
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟旧库损坏配置；现有保存入口应拒绝无 scheme URL，不能再用它制造坏数据。
+	if _, err := m.pg.Exec(`UPDATE llm_profiles SET proxy='invalid-proxy-without-scheme',proxy_mode='' WHERE id=$1`, profileID); err != nil {
 		t.Fatal(err)
 	}
 	task, err := m.CreateTaskWithOptions("invalid resolution", "report unavailable", db.TaskCreateOptions{

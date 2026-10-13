@@ -42,7 +42,8 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 		cleanup = func() {}
 		out     = base
 	)
-	if ToolAugment != nil {
+	questionMode, _ := ctx.Value(resultQuestionKey{}).(bool)
+	if ToolAugment != nil && !questionMode {
 		var extra []actool.CoreTool
 		var cl func()
 		extra, def, cl = ToolAugment(ctx, agentKey)

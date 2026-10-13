@@ -58,12 +58,14 @@ type Task struct {
 	CompanyIDs         []int64                  `json:"company_ids,omitempty"`
 	Status             string                   `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
-	TimeoutSeconds       int                    `json:"timeout_seconds"`
-	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
-	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
-	ProxyMode            pgdb.TaskProxyMode     `json:"proxy_mode"`
-	ProxyID              *int64                 `json:"proxy_id,omitempty"`
-	ProxySnapshot        pgdb.ProxySnapshot     `json:"proxy_snapshot,omitempty"`
+	TimeoutSeconds       int                `json:"timeout_seconds"`
+	PlanHeartbeatSeconds int                `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
+	CoverageEnabled      bool               `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	ProxyMode            pgdb.TaskProxyMode `json:"proxy_mode"`
+	ProxyID              *int64             `json:"proxy_id,omitempty"`
+	ProxySnapshot        pgdb.ProxySnapshot `json:"proxy_snapshot,omitempty"`
+	ProxyRevision        int64              `json:"proxy_revision"`
+	proxyMu              sync.RWMutex
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	Store                *pgdb.ExplorationStore `json:"-"`
@@ -877,7 +879,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
-		ProxyMode:       pt.ProxyMode, ProxyID: cloneInt64Ptr(pt.ProxyID), ProxySnapshot: pt.ProxySnapshot,
+		ProxyMode:       pt.ProxyMode, ProxyID: cloneInt64Ptr(pt.ProxyID), ProxySnapshot: pt.ProxySnapshot, ProxyRevision: pt.ProxyRevision,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
@@ -1129,6 +1131,10 @@ func (m *Manager) LoadExisting() []*Task {
 		log.Printf("[manager] reload: %v", err)
 		return nil
 	}
+	proxyStates, stateErr := m.pg.ListTaskProxyStates()
+	if stateErr != nil {
+		log.Printf("[manager] proxy state reload: %v", stateErr)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var loaded []*Task
@@ -1138,6 +1144,9 @@ func (m *Manager) LoadExisting() []*Task {
 			continue
 		}
 		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+		if state, ok := proxyStates[pt.ID]; ok {
+			t.setProxyState(state)
+		}
 		m.tasks[id] = t
 		loaded = append(loaded, t)
 	}
@@ -1204,7 +1213,8 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 
 	var queuedAt, completedAt, firstRunAt, deadlineAt sql.NullTime
 	var committedMode string
-	err = m.pg.QueryRow(`UPDATE tasks
+	err = m.pg.WithTaskProxyMutation(n, func(tx *sql.Tx) error {
+		return tx.QueryRow(`UPDATE tasks
 	SET status=$2,
 	    completed_at=CASE
 	        WHEN $2 IN ('done','failed','timeout') THEN COALESCE(completed_at, now())
@@ -1232,7 +1242,8 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 	    END
 	WHERE id=$1 AND deleted_at IS NULL AND status=$6
 	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at`, n, status, queued, mode, preservePosition, expectedStatus).
-		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt)
+			Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt)
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("task %s lifecycle changed before admission (expected status %q)", id, expectedStatus)
 	}
@@ -1483,7 +1494,7 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 
 func (m *Manager) releaseTaskProxy(t *Task) error {
 	// 无代理且未启动运行时的测试／离线调用不需要回收；实际运行时错误必须传播。
-	if _, err := m.proxyRuntime(); err != nil && (t == nil || t.ProxySnapshot.ID == 0) {
+	if _, err := m.proxyRuntime(); err != nil && (t == nil || t.proxyState().Snapshot.ID == 0) {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), proxyReleaseTimeout)

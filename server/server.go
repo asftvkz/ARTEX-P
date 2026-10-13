@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -776,6 +777,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/update/stream", s.updateStream)
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
+	s.registerTaskProxyRoutes(mux)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
 	mux.HandleFunc("GET /api/task-categories", s.pgListTaskCategories)
 	mux.HandleFunc("POST /api/task-categories", s.pgCreateTaskCategory)
@@ -1150,11 +1152,17 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		active = t.ID
 	}
 	list := s.m.List()
+	proxyStates, err := s.m.pg.ListTaskProxyStates()
+	if err != nil {
+		writeErr(w, 503, "任务代理状态暂不可读取")
+		return
+	}
 	metrics, _ := s.m.PG().TaskListMetricsAll()
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
-		dto := taskDTO(t, s.resolvedTaskStatus(t))
+		n, _ := strconv.ParseInt(t.ID, 10, 64)
+		dto := taskDTO(t, s.resolvedTaskStatus(t), proxyStates[n])
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
 		metric := metrics[t.ExpID]
 		dto.Tokens = tokenTotalDTO(metric.Tokens)
@@ -1911,7 +1919,21 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	n, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	row, err := s.m.pg.GetTask(n)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && row == nil) {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	if err != nil {
+		writeErr(w, 503, "任务代理状态暂不可读取")
+		return
+	}
+	dto := taskDTO(t, s.resolvedTaskStatus(t), db.TaskProxyState{Mode: row.ProxyMode, ID: row.ProxyID, Snapshot: row.ProxySnapshot, Revision: row.ProxyRevision})
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)
@@ -3852,6 +3874,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		Message     string           `json:"message"`
 		Attachments []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对任务工作目录)
 		Seg         *int             `json:"seg,omitempty"`         // 目标主会话分段;缺省=最新段
+		Followup    *taskFollowup    `json:"followup,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -3860,6 +3883,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	agentMessage, ok := s.prepareChatMentionMessage(w, req.Message)
 	if !ok {
 		return
+	}
+	continuation, err := taskFollowupContext(t, req.Followup)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if continuation != "" {
+		agentMessage = continuation + "\n用户的新问题：\n" + agentMessage
 	}
 	// Admission is serialized with deletion's chat cancellation. Mark every chat
 	// turn busy before its first activity/file write, including rule-mode turns.
@@ -3876,6 +3907,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, cancel := context.WithCancelCause(s.ctx)
+	if req.Followup != nil && req.Followup.Mode == "question" {
+		ctx = agent.WithResultQuestion(ctx)
+	}
 	ctx, finishOperation, admitted := s.engine.beginTaskOperationContext(ctx, t.ID)
 	if !admitted {
 		s.chatMu.Unlock()
@@ -3953,7 +3987,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm"})
 		return
 	}
-	reply := s.fallbackChat(t, req.Message)
+	var reply string
+	if req.Followup != nil && req.Followup.Mode == "question" {
+		reply = "当前未配置可用模型，暂不能解释这次结果。原 Worker 的记录已保留；配置模型后可在本任务继续追问。"
+	} else if req.Followup != nil && req.Followup.Mode == "execute" {
+		reply = s.fallbackChat(t, "意图 "+req.Message) + "\n当前未配置可用模型，配置后可继续执行；原记录已保留。"
+	} else {
+		reply = s.fallbackChat(t, req.Message)
+	}
 	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
 	s.finishTaskChat(t.ID, cancel)
 	finishOperation()

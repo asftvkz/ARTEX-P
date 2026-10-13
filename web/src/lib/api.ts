@@ -7,6 +7,7 @@ import type { ChatMention } from "@/lib/chat-mentions";
 import { type LLMProxyRequest, llmProxyWire } from "@/lib/llm-proxy";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
+import { type TaskProxyInput, validProxyRevision } from "@/lib/task-proxy";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -267,7 +268,15 @@ export const api = {
   // ---- tasks ----
   tasks: () =>
     get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
-  task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
+  task: (id: string) => http<Task>(`/tasks/${encodeURIComponent(id)}`, { cache: "no-store" }),
+  updateTaskProxy: (id: string, input: TaskProxyInput) => {
+    if (!validProxyRevision(input.expected_revision)) throw new Error("任务代理版本缺失或无效，请重新读取任务");
+    return put<Task>(`/tasks/${encodeURIComponent(id)}/proxy`, {
+      proxy_mode: input.proxy_mode,
+      proxy_id: input.proxy_id,
+      expected_revision: input.expected_revision,
+    });
+  },
   createTask: (input: {
     name?: string;
     categoryId?: number;
@@ -951,8 +960,9 @@ export const api = {
       `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,
       { signal },
     ),
-  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
-    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg }),
+  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number,
+    followup?: { intent_id: number; mode: "question" | "execute" }) =>
+    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg, followup }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // 方式1 文件上传:落到会话/任务工作目录 uploads/，返回可供 agent Read 的相对路径。
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {

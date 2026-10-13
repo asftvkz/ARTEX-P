@@ -92,6 +92,8 @@ export interface Task {
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
   proxy_mode?: TaskProxyMode;
+  // 服务端保证返回；前端仍须防御旧响应缺字段，绝不能按 0 提交。
+  proxy_revision?: number;
   proxy_id?: number;
   proxy?: TaskProxySnapshot;
 }

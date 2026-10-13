@@ -55,6 +55,7 @@ type Task struct {
 	ProxyMode       TaskProxyMode `json:"proxy_mode"`
 	ProxyID         *int64        `json:"proxy_id,omitempty"`
 	ProxySnapshot   ProxySnapshot `json:"proxy_snapshot,omitempty"`
+	ProxyRevision   int64         `json:"proxy_revision"`
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -438,12 +439,12 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(proxy_mode,'inherit'), proxy_id, COALESCE(proxy_snapshot,'{}'::jsonb)`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(proxy_mode,'inherit'), proxy_id, COALESCE(proxy_snapshot,'{}'::jsonb), proxy_revision`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
 	var proxySnapshot []byte
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.ProxyMode, &t.ProxyID, &proxySnapshot); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.ProxyMode, &t.ProxyID, &proxySnapshot, &t.ProxyRevision); err != nil {
 		return nil, err
 	}
 	if len(proxySnapshot) > 0 {
@@ -532,8 +533,10 @@ func (d *DB) GetTask(id int64) (*Task, error) {
 
 // SetPaused persists a task's paused flag.
 func (d *DB) SetPaused(id int64, paused bool) error {
-	_, err := d.Exec(`UPDATE tasks SET paused=$1 WHERE id=$2`, paused, id)
-	return err
+	return d.WithTaskProxyMutation(id, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE tasks SET paused=$1 WHERE id=$2`, paused, id)
+		return err
+	})
 }
 
 // Enqueue places a task at the tail of the persistent admission queue. Repeating
@@ -542,7 +545,8 @@ func (d *DB) Enqueue(id int64, mode string) error {
 	if mode != "bootstrap" && mode != "resume" {
 		return fmt.Errorf("invalid queue mode %q", mode)
 	}
-	_, err := d.Exec(`UPDATE tasks
+	return d.WithTaskProxyMutation(id, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE tasks
 SET queued=true,
     queued_at=CASE WHEN queued THEN COALESCE(queued_at, now()) ELSE now() END,
     queue_mode=CASE
@@ -550,18 +554,21 @@ SET queued=true,
         ELSE 'resume'
     END
 WHERE id=$1`, id, mode)
-	return err
+		return err
+	})
 }
 
 // Dequeue removes the concurrency hold. clearMode is false when a user pauses a
 // queued task, preserving whether its next admission must bootstrap or resume.
 func (d *DB) Dequeue(id int64, clearMode bool) error {
-	_, err := d.Exec(`UPDATE tasks
+	return d.WithTaskProxyMutation(id, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE tasks
 SET queued=false,
     queued_at=NULL,
     queue_mode=CASE WHEN $2 THEN '' ELSE queue_mode END
 WHERE id=$1`, id, clearMode)
-	return err
+		return err
+	})
 }
 
 // SetQueued is the compatibility helper used by older callers and tests. New
@@ -578,12 +585,14 @@ func (d *DB) SetQueued(id int64, queued bool) error {
 // stable); moving back to a non-terminal state clears it, so a re-run has no stale
 // finish time.
 func (d *DB) SetStatus(id int64, status string) error {
-	_, err := d.Exec(`
+	return d.WithTaskProxyMutation(id, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
 UPDATE tasks
    SET status = $1,
        completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END
  WHERE id = $2`, status, id)
-	return err
+		return err
+	})
 }
 
 // SetTerminalStatusGuarded sets a terminal status only when the task is NOT already
@@ -658,6 +667,16 @@ func (d *DB) DeleteTaskCascadePrepared(
 		return result, err
 	}
 	defer tx.Rollback()
+	if err := lockProxyLifecycle(tx); err != nil {
+		return result, err
+	}
+	var busy bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM task_operation_activity WHERE task_id=$1 AND (active_count>0 OR switch_token<>'')) OR EXISTS(SELECT 1 FROM task_proxy_activity WHERE task_id=$1)`, id).Scan(&busy); err != nil {
+		return result, err
+	}
+	if busy {
+		return result, ErrProxyInUse
+	}
 	var expID int64
 	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1 FOR UPDATE`, id).Scan(&expID); err != nil {
 		if err == sql.ErrNoRows {
