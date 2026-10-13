@@ -172,6 +172,9 @@ func Open(dsn string) (*DB, error) {
 		if err := d.EnsureProxyActivitySchema(); err != nil {
 			return fmt.Errorf("migrate task proxy switch: %w", err)
 		}
+		if err := d.MigrateProxyCreateIntents(context.Background()); err != nil {
+			return fmt.Errorf("migrate proxy create intents: %w", err)
+		}
 		if err := d.seedBuiltins(); err != nil {
 			return fmt.Errorf("seed builtins: %w", err)
 		}

@@ -253,7 +253,13 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		rows, err := pg.ListTools()
 		if err != nil {
 			log.Printf("[tools] 读取工具表失败，按代码默认放行: %v", err)
-			return tools
+			out := tools[:0:0]
+			for _, tool := range tools {
+				if !isProxyCenterTool(tool.Name()) {
+					out = append(out, tool)
+				}
+			}
+			return out
 		}
 		byKey := make(map[string]*db.Tool, len(rows))
 		for _, t := range rows {
@@ -265,16 +271,23 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			if len(row.Schema) > 0 {
 				_ = json.Unmarshal(row.Schema, &schema)
 			}
-			return meterTool(agent.DecorateTool(t, row.Description, schema), pg, row.Key, agentKey, runInfo)
+			resolved := meterTool(agent.DecorateTool(t, row.Description, schema), pg, row.Key, agentKey, runInfo)
+			if isProxyCenterTool(t.Name()) {
+				return &authorizedProxyTool{CoreTool: resolved, pg: pg, agentKey: agentKey, schema: t.InputSchema()}
+			}
+			return resolved
 		}
 		out := tools[:0:0]
 		for _, t := range tools {
 			row, known := byKey[t.Name()]
 			if !known { // MCP/skill/host tool: no row → untouched
+				if isProxyCenterTool(t.Name()) {
+					continue
+				}
 				out = append(out, t)
 				continue
 			}
-			if !row.Enabled || !contains(row.Agents, agentKey) {
+			if !row.Enabled || !contains(row.Agents, agentKey) || (isProxyCenterTool(t.Name()) && !row.System) {
 				continue // disabled globally or not bound to this agent → drop
 			}
 			out = append(out, resolve(t, row))

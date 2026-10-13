@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -97,9 +98,23 @@ func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
 		s.createWarpProxy(w, r, p, req, parsed.String())
 		return
 	}
+	// 单条 HTTP 表单已有明确的显式凭据优先约定；先合并为唯一 URL，再走公共校验。
+	// 新批量接口和工具仅接受一个凭据来源，避免模型猜测覆盖顺序。
+	if p.Kind != db.ProxyKindResin && (req.Password != nil || req.Username != "") {
+		if err := db.ValidateProxy(p); err != nil {
+			writeErr(w, 400, "代理创建参数无效")
+			return
+		}
+		req.URL, req.Password, req.Username = &p.URL, nil, ""
+	}
+	p, err := validatedProxyCreate(req)
+	if err != nil {
+		writeErr(w, 400, "代理创建参数无效或存在冲突")
+		return
+	}
 	created, err := s.m.pg.CreateProxy(p)
 	if err != nil {
-		writeErr(w, 400, err.Error())
+		writeErr(w, 400, "代理创建失败")
 		return
 	}
 	writeJSON(w, 201, s.runtimeProxyDTO(created))
@@ -254,6 +269,17 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "代理不存在")
 		return
 	}
+	if p.Kind != db.ProxyKindWarp {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		checked, code := s.probeProxyCenter(ctx, id, "")
+		if code != "" {
+			writeErr(w, 502, "代理检测失败或状态未保存")
+			return
+		}
+		writeJSON(w, 200, s.runtimeProxyDTO(checked))
+		return
+	}
 	if p.Kind == db.ProxyKindWarp {
 		pending, err := s.m.pg.WarpCreatePending(id)
 		if err != nil {
@@ -343,6 +369,7 @@ func proxyFromRequest(req proxyRequest) *db.Proxy {
 
 // RegisterProxyActionRoutes 供共享路由装配调用；响应统一使用前端代理 DTO。
 func (s *Server) RegisterProxyActionRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/proxies/batch", s.batchCreateProxies)
 	mux.HandleFunc("GET /api/proxies/{id}", s.getProxy)
 	mux.HandleFunc("POST /api/proxies/{id}/warp/{action}", s.warpAction)
 	mux.HandleFunc("POST /api/proxies/{id}/resin/release", s.releaseResin)
