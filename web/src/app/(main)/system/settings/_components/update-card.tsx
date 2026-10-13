@@ -16,12 +16,19 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { api, sseUrl } from "@/lib/api";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { api } from "@/lib/api";
+import { waitForUpdate } from "@/lib/update-flow";
 import type { UpdateCheck, UpdateProgress } from "@/lib/types";
-
-/** 等待新版本上线的最长时间。一次升级要经过三次进程启动（暂存 → 换装 → 新版），
- *  每次都是秒级，三分钟足够覆盖慢磁盘和 Docker 容器重建。 */
-const RESTART_TIMEOUT_MS = 180_000;
 
 function humanSize(n?: number): string {
   if (!n || n <= 0) return "";
@@ -41,9 +48,12 @@ export function UpdateCard() {
   const [info, setInfo] = React.useState<UpdateCheck | null>(null);
   const [checking, setChecking] = React.useState(true);
   const [progress, setProgress] = React.useState<UpdateProgress | null>(null);
-  // 与 progress 分开：暂存完成后进程就没了，SSE 会断，此时要切到轮询 /api/health。
+  // 暂存后的重启窗口单独展示，继续轮询实际版本和持久确认状态。
   const [restarting, setRestarting] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const [confirmation, setConfirmation] = React.useState<"update" | "rollback" | null>(null);
+  const locked = React.useRef(false);
+  const waiting = React.useRef<AbortController | null>(null);
 
   // quiet 同时决定要不要绕过后端缓存：进页面时的自动检查用缓存（顶栏刚查过），
   // 用户手动点「检查更新」则强制回源，否则刚发布的版本要等缓存过期才看得到。
@@ -69,111 +79,85 @@ export function UpdateCard() {
     check(true);
   }, [check]);
 
-  // 轮询 /api/health 直到版本号变化。
-  //
-  // 判据必须是"版本变了"而不是"能连上了"：换装过程中旧版本会短暂地重新起来一次
-  // （那一次只负责把 artex.new 换上去然后立刻退出），只看连通性会误判成功。
-  const waitForNewVersion = React.useCallback(async (fromVersion: string) => {
-    setRestarting(true);
-    const deadline = Date.now() + RESTART_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      await sleep(2000);
-      try {
-        const r = await fetch("/api/health", { cache: "no-store" });
-        if (r.ok) {
-          const j = (await r.json()) as { version?: string };
-          if (j.version && j.version !== fromVersion) {
-            toast.success(`已更新到 ${j.version}，正在重新加载页面`);
-            await sleep(800);
-            window.location.reload();
-            return;
-          }
-        }
-      } catch {
-        // 重启窗口内连不上是预期的，继续轮询。
+  const monitor = React.useCallback(async (target: string | undefined, from: string) => {
+    const controller = new AbortController();
+    waiting.current = controller;
+    try {
+      const result = await waitForUpdate(target, from, api.updateStatus, {
+        signal: controller.signal,
+        onStatus: (status) => {
+          setRestarting(status.pending || status.phase === "staged");
+          setProgress({
+            phase: status.phase ?? "idle",
+            percent: status.percent ?? -1,
+            message: status.message || "正在应用更新…",
+            error: status.error,
+          });
+        },
+      });
+      toast.success(`当前版本 ${result.current} 已稳定运行，正在重新加载页面`);
+      await sleep(800);
+      if (!controller.signal.aborted) window.location.reload();
+    } catch (error) {
+      if (!controller.signal.aborted) toast.error((error as Error).message);
+    } finally {
+      if (!controller.signal.aborted) {
+        locked.current = false;
+        setBusy(false);
+        setRestarting(false);
       }
     }
-    setRestarting(false);
-    toast.error("等待服务重启超时。请检查后端日志，或确认 artex 是通过 start.sh / start.bat 启动的。");
   }, []);
 
-  // 订阅更新进度。SSE 不走 Next 的 /api 重写（那层会缓冲，事件推不出来）。
-  const openStream = React.useCallback(
-    (fromVersion: string) => {
-      const es = new EventSource(sseUrl("/api/update/stream"));
-      es.onmessage = (ev) => {
-        let p: UpdateProgress;
-        try {
-          p = JSON.parse(ev.data) as UpdateProgress;
-        } catch {
-          return;
+  React.useEffect(() => {
+    let active = true;
+    // 刷新后恢复监测；重启后的状态不依赖已经断开的 SSE 或 GitHub 查询。
+    api
+      .updateStatus()
+      .then((status) => {
+        if (active && !locked.current && status.running) {
+          locked.current = true;
+          setBusy(true);
+          void monitor(status.version || status.current, status.current);
         }
-        setProgress(p);
-        if (p.phase === "failed") {
-          es.close();
-          setBusy(false);
-          toast.error("更新失败：" + (p.error || p.message));
-          return;
-        }
-        if (p.phase === "staged") {
-          es.close();
-          void waitForNewVersion(fromVersion);
-        }
-      };
-      es.onerror = () => {
-        // 进程退出时 SSE 必然断开。如果已经进入等待重启，这属于正常现象，
-        // 交给 /api/health 轮询继续判定即可。
-        es.close();
-      };
-      return es;
-    },
-    [waitForNewVersion],
-  );
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+      waiting.current?.abort();
+    };
+  }, [monitor]);
 
-  const doUpdate = () => {
-    if (!info) return;
-    const from = info.current;
-    const ok = window.confirm(
-      `确定更新到 ${info.latest}？\n\n` +
-        "更新会重启程序，正在运行的任务会被中断。\n" +
-        (info.mode === "docker"
-          ? "\n注意：容器内更新只替换程序本身，不会更新镜像里的 playwright / nmap 等工具链；" +
-            "若新版本依赖新工具，请改用 docker compose pull。"
-          : ""),
-    );
-    if (!ok) return;
-
+  const perform = async (action: "update" | "rollback") => {
+    if (!info || locked.current) return;
+    locked.current = true; // 同一事件循环的重复点击也不能重复提交。
+    setConfirmation(null);
     setBusy(true);
     setProgress({ phase: "downloading", percent: 0, message: "准备中…" });
-    const es = openStream(from);
-    api.applyUpdate().catch((e) => {
-      es.close();
+    try {
+      if (action === "update") {
+        const result = await api.applyUpdate();
+        await monitor(result.target, info.current);
+      } else {
+        const result = await api.rollbackUpdate();
+        await monitor(result.target || undefined, info.current);
+      }
+    } catch (error) {
+      // 响应丢失时先查执行状态，不能立刻让用户重复提交。
+      try {
+        const status = await api.updateStatus();
+        if (status.running || status.current !== info.current) {
+          await monitor(status.version || (action === "update" ? info.latest : undefined), info.current);
+          return;
+        }
+      } catch {
+        /* 保留原始提交错误。 */
+      }
+      locked.current = false;
       setBusy(false);
       setProgress(null);
-      toast.error("启动更新失败：" + (e as Error).message);
-    });
-  };
-
-  const doRollback = () => {
-    if (!info) return;
-    if (
-      !window.confirm(
-        "回滚到上一版本？\n\n程序会重启，正在运行的任务会被中断。\n注意：数据库结构不会回退，旧版本可能无法识别新版写入的数据。",
-      )
-    )
-      return;
-    const from = info.current;
-    setBusy(true);
-    api
-      .rollbackUpdate()
-      .then(() => {
-        toast.success("已切换到上一版本，正在重启…");
-        void waitForNewVersion(from);
-      })
-      .catch((e) => {
-        setBusy(false);
-        toast.error("回滚失败：" + (e as Error).message);
-      });
+      toast.error((action === "update" ? "启动更新失败：" : "回滚失败：") + (error as Error).message);
+    }
   };
 
   const phase = progress?.phase;
@@ -265,12 +249,15 @@ export function UpdateCard() {
           </p>
         )}
 
-        {info?.mode === "docker" && info.has_update && (
+        {info?.mode === "docker" && info.persistent_update === false && (
+          <p className="text-xs text-destructive">
+            此容器仍使用旧版启动器，需先部署支持持久更新的镜像；此后可直接在页面升级。
+          </p>
+        )}
+        {info?.mode === "docker" && info.persistent_update !== false && info.has_update && (
           <p className="text-xs text-muted-foreground">
-            Docker 下的更新只替换程序本身，不更新镜像里的 playwright / nmap 等工具链，且
-            <span className="font-mono"> docker compose up -d </span>
-            重建容器后会退回镜像自带的版本。需要连镜像一起升级请执行
-            <span className="font-mono"> docker compose pull artex &amp;&amp; docker compose up -d artex</span>。
+            新版程序（含页面）和上一版备份保存在数据卷。重启或重建容器仍保留已更新版本，启动失败会自动回滚。
+            系统工具由镜像提供，工具链升级需更新镜像。
           </p>
         )}
 
@@ -290,24 +277,64 @@ export function UpdateCard() {
           </Button>
           <Button
             size="sm"
-            onClick={doUpdate}
-            disabled={busy || restarting || !info?.has_update || info?.asset_available === false}
+            onClick={() => setConfirmation("update")}
+            disabled={
+              busy ||
+              restarting ||
+              !info?.has_update ||
+              info?.asset_available === false ||
+              (info?.mode === "docker" && info.persistent_update === false)
+            }
           >
             <DownloadIcon className="size-4" />
             {info?.has_update ? `更新到 ${info.latest}` : "立即更新"}
           </Button>
           {info?.has_backup && (
-            <Button variant="ghost" size="sm" onClick={doRollback} disabled={busy || restarting}>
+            <Button variant="ghost" size="sm" onClick={() => setConfirmation("rollback")} disabled={busy || restarting}>
               <RotateCcwIcon className="size-4" />
               回滚到上一版本
             </Button>
           )}
         </div>
 
-        <p className="text-xs text-muted-foreground">
-          一键更新依赖守护脚本重启程序。请通过 <span className="font-mono">start.sh</span>（Windows 为
-          <span className="font-mono"> start.bat</span>）启动 ARTEX；直接运行 artex 本体时，程序退出后不会被自动拉起。
-        </p>
+        {info?.mode !== "docker" && (
+          <p className="text-xs text-muted-foreground">
+            一键更新依赖守护脚本重启程序。请通过 <span className="font-mono">start.sh</span>（Windows 为
+            <span className="font-mono"> start.bat</span>）启动 ARTEX；直接运行 artex 本体时，程序退出后不会被自动拉起。
+          </p>
+        )}
+        <AlertDialog
+          open={confirmation !== null}
+          onOpenChange={(open) => {
+            if (!open) setConfirmation(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {confirmation === "rollback" ? "回滚到上一版本？" : `更新到 ${info?.latest ?? "新版本"}？`}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {confirmation === "rollback"
+                  ? "程序会重启，正在运行的任务会被中断。数据库不会回退，请确认上一版本兼容当前数据。"
+                  : info?.mode === "docker"
+                    ? "将下载并校验新版程序，保存到数据卷后自动重启。正在运行的任务会被中断；数据和配置保留，启动失败自动回滚。"
+                    : "将下载并校验新版程序后自动重启。正在运行的任务会被中断，启动失败自动回滚。"}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>取消</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => {
+                  if (confirmation) void perform(confirmation);
+                }}
+                disabled={busy}
+              >
+                {confirmation === "rollback" ? "确认回滚" : "确认更新"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </CardContent>
     </Card>
   );

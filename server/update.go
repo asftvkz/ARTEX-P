@@ -135,6 +135,25 @@ var updHub = &updateHub{
 	subs: map[chan updateProgress]struct{}{},
 }
 
+// updateStatus 不查询发布源，容器重启期间前端也能及时核验实际版本及启动确认。
+func (s *Server) updateStatus(w http.ResponseWriter, r *http.Request) {
+	cur, running := updHub.snapshot()
+	boot := bootUpdateState()
+	pending := selfupdate.Pending()
+	message := cur.Message
+	if boot.RolledBack {
+		message = boot.Detail
+	}
+	if pending && cur.Phase == selfupdate.PhaseIdle {
+		message = "新版正在进行启动确认…"
+	}
+	writeJSON(w, 200, map[string]any{
+		"current": BuildVersion, "pending": pending, "running": running || pending,
+		"rolled_back": boot.RolledBack, "message": message, "phase": cur.Phase,
+		"percent": cur.Percent, "error": cur.Error, "version": cur.Version,
+	})
+}
+
 // begin 抢占升级权限，已在进行中则返回 false。
 func (h *updateHub) begin(version string) bool {
 	h.mu.Lock()
@@ -215,14 +234,16 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	boot := bootUpdateState()
 	out := map[string]any{
-		"current":     current,
-		"mode":        mode,
-		"os":          runtime.GOOS,
-		"arch":        runtime.GOARCH,
-		"has_backup":  selfupdate.HasBackup(),
-		"repo":        selfupdate.Repo,
-		"boot_notice": boot.Detail,
-		"rolled_back": boot.RolledBack,
+		"current":           current,
+		"mode":              mode,
+		"os":                runtime.GOOS,
+		"arch":              runtime.GOARCH,
+		"has_backup":        selfupdate.HasBackup(),
+		"repo":              selfupdate.Repo,
+		"boot_notice":       boot.Detail,
+		"rolled_back":       boot.RolledBack,
+		"update_pending":    selfupdate.Pending(),
+		"persistent_update": selfupdate.PersistentRuntime(),
 	}
 
 	// 顶栏提示走缓存（默认）；用户点"检查更新"时带 force=1 强制回源。
@@ -269,6 +290,10 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 // 挂在请求上会被反代超时掐断。进度走 /api/update/stream。
 func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	current := BuildVersion
+	if selfupdate.InDocker() && !selfupdate.PersistentRuntime() {
+		writeErr(w, 409, "此容器仍使用旧版启动器，请先更新到支持持久更新的镜像")
+		return
+	}
 
 	// 走缓存：确保装上的就是用户在界面上看到并确认的那个版本。
 	client := selfupdate.NewClient(s.m.GlobalProxy())
@@ -286,10 +311,11 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("当前已是最新版本 %s", current))
 		return
 	}
-	if !updHub.begin(rel.TagName) {
+	if selfupdate.Pending() || !updHub.begin(rel.TagName) {
 		writeErr(w, 409, "已有一个更新正在进行中")
 		return
 	}
+	SetBootUpdateState(selfupdate.State{})
 
 	go func() {
 		// 刻意用 s.ctx 而不是请求的 ctx：HTTP 响应一返回请求就结束了，
@@ -313,16 +339,21 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 
 // updateRollback 主动退回上一版本（换装前备份的 artex.old）。
 func (s *Server) updateRollback(w http.ResponseWriter, r *http.Request) {
-	if _, running := updHub.snapshot(); running {
+	target := selfupdate.BackupVersion()
+	if selfupdate.Pending() || !updHub.begin(target) {
 		writeErr(w, 409, "更新正在进行中，无法回滚")
 		return
 	}
+	SetBootUpdateState(selfupdate.State{})
 	if err := selfupdate.Rollback(); err != nil {
+		updHub.finish(err)
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// 保持执行占用直到旧进程退出，避免切换后的短窗口接受另一次更新。
+	updHub.publish(selfupdate.PhaseStaged, 100, "已切换到上一版本，正在重启…")
 	log.Printf("[update] 已手动回滚到上一版本，即将退出以完成切换")
-	writeJSON(w, 202, map[string]any{"ok": true})
+	writeJSON(w, 202, map[string]any{"ok": true, "target": target})
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		requestRestart()

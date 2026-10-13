@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -109,19 +110,21 @@ func Stage(ctx context.Context, c *http.Client, rel *Release, currentVersion str
 	if err := os.WriteFile(p.Sum, []byte(binSum), 0o644); err != nil {
 		return fmt.Errorf("写入校验和: %w", err)
 	}
+	if err := writeMarker(p.Marker, marker{
+		From:      currentVersion,
+		To:        strings.TrimPrefix(rel.TagName, "v"),
+		StagedAt:  time.Now().Unix(),
+		Preparing: true,
+	}); err != nil {
+		cleanStaged(p)
+		return fmt.Errorf("写入升级保护标记失败，已取消更新: %w", err)
+	}
 	if err := os.Rename(binPath, p.New); err != nil {
-		_ = os.Remove(p.Sum)
+		cleanStaged(p)
+		_ = os.Remove(p.Marker)
 		return fmt.Errorf("暂存新版本: %w", err)
 	}
-
-	if err := writeMarker(p.Marker, marker{
-		From:     currentVersion,
-		To:       strings.TrimPrefix(rel.TagName, "v"),
-		StagedAt: time.Now().Unix(),
-	}); err != nil {
-		// 标记只影响自动回滚能力，暂存件本身已就位，不因此中断升级。
-		prog(PhaseStaged, -1, "警告：写入升级标记失败，本次升级将没有自动回滚保护")
-	}
+	_ = os.Remove(filepath.Join(p.Dir, "notice.json"))
 
 	prog(PhaseStaged, 100, "新版本已就绪，正在重启…")
 	return nil

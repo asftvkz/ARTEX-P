@@ -33,8 +33,8 @@ jobs:
           cache: true
       - name: Test update download, verification and rollback
         run: |
-          timeout 60s go test ./selfupdate -count=1 -timeout 60s
-          timeout 60s go test ./server -run '^TestReleaseCache' -count=1 -timeout 60s
+          timeout 60s go test ./selfupdate ./config -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateStatus|TestWorkspaceProtects)' -count=1 -timeout 60s
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -42,6 +42,9 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci --ignore-scripts
         working-directory: web
+      - name: Test update state and restart recovery
+        working-directory: web
+        run: timeout 60s node --import ./scripts/test-api-loader.mjs --test src/lib/update-flow.test.mjs src/lib/update-api.test.mjs
       - name: Export production frontend
         working-directory: web
         env:
