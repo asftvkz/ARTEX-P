@@ -618,6 +618,65 @@ func TestProxyPGWarpChannelDeletePreservesProfile(t *testing.T) {
 	}
 }
 
+func TestProxyPGWarpDeleteRunning(t *testing.T) {
+	if warpFixtureSubprocess(t) {
+		return
+	}
+	t.Setenv("ARTEX_PG_DSN", os.Getenv("ARTEX_WARP_CHILD_DSN"))
+	s, mux := proxyIntegration(t)
+	mux.HandleFunc("DELETE /api/proxies/{id}", s.deleteProxy)
+	t.Setenv("ARTEX_WARP_CALL_LOG", filepath.Join(t.TempDir(), "calls.log"))
+	t.Setenv("ARTEX_WARP_FIXTURE_MODE", "ready")
+	key := uuid.NewString()
+	body := `{"name":"直接删除运行出口","kind":"warp","accept_terms":true}`
+	code, out, raw := warpCreateHTTP(t, mux, key, body, false)
+	if code != 201 {
+		t.Fatalf("创建失败: %d %s", code, raw)
+	}
+	id := int64(out["id"].(float64))
+	path := fmt.Sprintf("/api/proxies/%d", id)
+	rt, err := s.m.proxyRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.m.pg.SetGlobalProxyID(nil); _ = s.m.pg.DeleteProxy(id) })
+	conn, err := rt.warp.Connection(warpProfileID(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.SetGlobalProxyID(&id); err != nil {
+		t.Fatal(err)
+	}
+	code, _, raw = proxyAPI(t, mux, "DELETE", path, "")
+	if code != 409 {
+		t.Fatalf("全局引用应阻止删除: %d %s", code, raw)
+	}
+	if _, err := rt.warp.Connection(warpProfileID(id)); err != nil {
+		t.Fatalf("被拒绝的删除停止了出口: %v", err)
+	}
+	if err := s.m.pg.SetGlobalProxyID(nil); err != nil {
+		t.Fatal(err)
+	}
+	code, _, raw = proxyAPI(t, mux, "DELETE", path, "")
+	if code != 200 {
+		t.Fatalf("运行中的出口应直接删除，无需先停止: %d %s", code, raw)
+	}
+	if _, err := s.m.pg.GetProxy(id); err == nil {
+		t.Fatal("删除后仍存在代理行")
+	}
+	if _, err := os.Stat(filepath.Join(os.Getenv("ARTEX_WARP_DIR"), warpProfileID(id))); !os.IsNotExist(err) {
+		t.Fatalf("删除后仍存在档案: %v", err)
+	}
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", conn.Port), time.Second); err == nil {
+		c.Close()
+		t.Fatal("删除后运行器仍监听端口")
+	}
+	code, _, raw = warpCreateHTTP(t, mux, key, body, false)
+	if code != 410 {
+		t.Fatalf("删除后重放应保留墓碑: %d %s", code, raw)
+	}
+}
+
 func TestProxyPGChannelBindWaitsForDeleteCleanup(t *testing.T) {
 	s, _ := proxyIntegration(t)
 	p := createRuntimeProxy(t, s, "http://127.0.0.1:19981")

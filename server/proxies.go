@@ -224,15 +224,12 @@ func (s *Server) deleteProxy(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		profile, err := rt.warp.Get(warpProfileID(id))
+		_, err = rt.warp.Get(warpProfileID(id))
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		if err != nil {
 			return errors.New("WARP 档案不可读")
-		}
-		if profile.Desired {
-			return errors.New("请先停止 WARP 出口")
 		}
 		return rt.warp.Delete(r.Context(), warpProfileID(id))
 	}); err != nil {

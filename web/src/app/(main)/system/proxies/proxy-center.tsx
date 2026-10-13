@@ -5,6 +5,16 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -81,6 +91,7 @@ export function ProxyCenter() {
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState("");
   const [busy, setBusy] = React.useState("");
+  const [deleting, setDeleting] = React.useState<ProxyRecord | null>(null);
   const mutationLock = React.useRef(false);
   const [saveError, setSaveError] = React.useState("");
   const [warpCreation] = React.useState(() => new WarpCreateIntent());
@@ -426,16 +437,20 @@ export function ProxyCenter() {
     }
   }
   async function remove(item: ProxyRecord) {
-    if (!window.confirm(`确认删除代理 #${item.id}「${item.name}」？任务占用时服务端会拒绝。`)) return;
+    if (mutationLock.current) return;
+    mutationLock.current = true;
     setBusy(`delete:${item.id}`);
     try {
       await api.deleteProxy(item.id);
+      mutationLock.current = false;
       if (editing?.id === item.id) reset();
+      setDeleting(null);
       toast.success(`代理 #${item.id} 已删除`);
       await refreshAfterMutation();
     } catch (error) {
       toast.error(`删除失败：${errorText(error)}`);
     } finally {
+      mutationLock.current = false;
       setBusy("");
     }
   }
@@ -801,7 +816,7 @@ export function ProxyCenter() {
                     <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void test(item.id)}>
                       {busy === `test:${item.id}` ? "检测中…" : "检测"}
                     </Button>
-                    <Button size="sm" variant="destructive" disabled={!!busy} onClick={() => void remove(item)}>
+                    <Button size="sm" variant="destructive" disabled={!!busy} onClick={() => setDeleting(item)}>
                       删除
                     </Button>
                   </div>
@@ -855,6 +870,36 @@ export function ProxyCenter() {
             ))}
         </CardContent>
       </Card>
+
+      <AlertDialog
+        open={deleting !== null}
+        onOpenChange={(open) => {
+          if (!open && !mutationLock.current) setDeleting(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除代理「{deleting?.name}」？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleting?.kind === "warp" ? "删除会自动断开 WARP 出口并清理本地注册档案。" : "删除后此代理将从代理中心移除。"}
+              正在创建、被任务或渠道引用、设为全局默认的代理无法删除，请先解除引用。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={!!busy}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={!!busy}
+              onClick={(event) => {
+                event.preventDefault();
+                if (deleting) void remove(deleting);
+              }}
+            >
+              {busy.startsWith("delete:") ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* WARP 注册条款确认：勾选项默认不选中；取消不发请求；确认后才带 accept_terms:true。 */}
       <Dialog

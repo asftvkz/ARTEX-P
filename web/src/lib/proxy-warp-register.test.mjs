@@ -31,7 +31,7 @@ test("注册不确定、启动中、未知 phase 禁止重注册；失败只能�
   assert.deepEqual(warpAllowedActions(item({ warp_phase: "failed", status: "failed" })), ["recover"]);
   assert.deepEqual(warpAllowedActions(item({ warp_phase: "unregistered" })), ["register"]);
   assert.deepEqual(warpAllowedActions(item({ warp_phase: "stopped" })), ["start", "recover"]);
-  assert.deepEqual(warpAllowedActions(item()), ["stop"]);
+  assert.deepEqual(warpAllowedActions(item()), []);
 });
 
 test("已建档失败只接受与 proxy_id 一致的正数 ID；网络失败不按名称猜 ID", () => {
