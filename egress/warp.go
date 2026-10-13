@@ -604,9 +604,12 @@ func (m *WarpManager) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if p.Desired || m.processes[id] != nil {
-		return errors.New("请先停止 WARP 出口再删除")
+	// 管理端已检查引用；删除直接停止出口，先保存停止意图以免中断后自动恢复。
+	p.Desired, p.Phase, p.EgressIP, p.LastError = false, "stopped", "", ""
+	if err := m.save(path, p); err != nil {
+		return err
 	}
+	m.stopProcessLocked(id)
 	return os.RemoveAll(path)
 }
 

@@ -141,7 +141,7 @@ export function warpAllowedActions(item: ProxyRecord): WarpActionKind[] {
     case "unregistered":
       return ["register"];
     case "ready":
-      return warpReady(item) ? ["stop"] : ["recover"];
+      return warpReady(item) ? [] : ["recover"];
     case "stopped":
       return ["start", "recover"];
     case "failed":
