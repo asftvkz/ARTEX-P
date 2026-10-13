@@ -1,0 +1,10 @@
+{
+  "name": "artex-browser-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@playwright/cli": "0.1.22",
+    "@playwright/mcp": "0.0.83",
+    "playwright": "1.64.0-alpha-1790635538000"
+  }
+}

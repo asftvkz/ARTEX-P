@@ -20,6 +20,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
+	browserruntime "github.com/Autumn-27/artex/runtime/playwright"
 	"github.com/Autumn-27/artex/selfupdate"
 	"github.com/Autumn-27/artex/server"
 )
@@ -111,6 +112,16 @@ func run() int {
 	defer stop()
 	ctx, shutdown := shutdownContext(sigCtx)
 	defer shutdown(agent.AbortShutdown)
+	toolRoot, err := browserruntime.Prepare(*dataDir)
+	if err != nil {
+		log.Printf("[browser] 工具包准备失败: %v", err)
+		return 1
+	}
+	go func() {
+		if err := browserruntime.Install(ctx, toolRoot); err != nil {
+			log.Printf("[browser] %v", err)
+		}
+	}()
 
 	// 代理密钥独立于 JWT；容器通过独立卷持久化，丢失/损坏时启动失败。
 	secretPath := os.Getenv("ARTEX_PROXY_SECRETS_FILE")

@@ -28,6 +28,14 @@ func proxyObject(props map[string]any, required ...string) map[string]any {
 func proxyInteger(desc string, min, max int) map[string]any {
 	return map[string]any{"type": "integer", "description": desc, "minimum": min, "maximum": max}
 }
+
+func proxySafeIntegerMax() int {
+	if strconv.IntSize < 64 {
+		return int(^uint(0) >> 1)
+	}
+	max, _ := strconv.ParseInt("9007199254740991", 10, 64)
+	return int(max)
+}
 func proxyArray(items map[string]any, max int) map[string]any {
 	return map[string]any{"type": "array", "items": items, "minItems": 1, "maxItems": max}
 }
@@ -48,11 +56,11 @@ func proxyAddSchema() map[string]any {
 	}, "item_key", "name", "kind"), 50)}, "items")
 }
 func proxyListSchema() map[string]any {
-	return proxyObject(map[string]any{"after_id": proxyInteger("从此 ID 之后分页", 0, 9007199254740991), "limit": proxyInteger("返回数量，默认 50", 1, 100)})
+	return proxyObject(map[string]any{"after_id": proxyInteger("从此 ID 之后分页", 0, proxySafeIntegerMax()), "limit": proxyInteger("返回数量，默认 50", 1, 100)})
 }
 func proxyTestSchema() map[string]any {
 	return proxyObject(map[string]any{
-		"proxy_ids":       proxyArray(proxyInteger("代理 ID", 1, 9007199254740991), 20),
+		"proxy_ids":       proxyArray(proxyInteger("代理 ID", 1, proxySafeIntegerMax()), 20),
 		"concurrency":     proxyInteger("批内并发，默认 2；进程全局最多 4", 1, 4),
 		"timeout_seconds": proxyInteger("单项网络超时，默认 10 秒；整批最多 30 秒，状态写入另限 2 秒", 1, 15),
 		"target_url":      strParam("可选 HTTP(S) 检测目标，不含凭据/查询串；默认 Cloudflare trace。仅经指定代理访问，不切换出口"),

@@ -20,7 +20,7 @@ func TestProxyCreateIntentAtomicReplay(t *testing.T) {
 		t.Skip("需要隔离的本地 PostgreSQL")
 	}
 	u, err := url.Parse(dsn)
-	if err != nil || u.Host != "127.0.0.1:25432" || u.Path != "/artex_proxy_verify_test" || u.RawQuery != "sslmode=disable" {
+	if err != nil || u.Host != "127.0.0.1:25432" || (u.Path != "/artex_proxy_verify_test" && u.Path != "/artex_proxy_test") || u.RawQuery != "sslmode=disable" {
 		t.Fatal("拒绝非本地隔离测试库")
 	}
 	d, err := Open(dsn)

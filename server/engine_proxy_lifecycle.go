@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -50,6 +51,8 @@ func (e *Engine) beginTaskOperationContext(ctx context.Context, id string) (cont
 		e.m.proxyTickets.Store(ticket, struct{}{})
 	}
 	stop := context.AfterFunc(ctx, func() { ticket.active.Store(false) })
+	var cleanupFailed atomic.Bool
+	ctx = agent.WithBrowserCleanupFailure(ctx, func() { cleanupFailed.Store(true) })
 	var once sync.Once
 	finish := func() {
 		once.Do(func() {
@@ -57,6 +60,11 @@ func (e *Engine) beginTaskOperationContext(ctx context.Context, id string) (cont
 			ticket.active.Store(false)
 			if e.m != nil {
 				e.m.proxyTickets.Delete(ticket)
+			}
+			if cleanupFailed.Load() {
+				// 保留持久引用与会话屏障，避免未退出的浏览器跨越出口切换。
+				log.Printf("[proxy] 任务 %s 浏览器未确认退出，保留操作占用", id)
+				return
 			}
 			e.decInflight(id)
 		})

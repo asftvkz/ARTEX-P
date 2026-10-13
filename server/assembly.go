@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -83,8 +85,24 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 				if !directVisible && !skillGated {
 					continue // neither directly visible nor referenced by a visible skill
 				}
+				// 兼容既有默认 npx 配置，运行时使用本次程序随附的固定包，不覆写用户数据库配置。
+				if m.Name == browserMCPName && m.Transport == "stdio" && m.Command == "npx" && os.Getenv("ARTEX_PLAYWRIGHT_ROOT") != "" {
+					args := jsonStrSlice(m.Args)
+					if len(args) > 0 && (args[0] == "@playwright/mcp" || args[0] == "@playwright/mcp@latest") {
+						copy := *m
+						copy.Command = "playwright-mcp"
+						copy.Args, _ = json.Marshal(args[1:])
+						m = &copy
+					}
+				}
 				if len(managers) > 0 {
-					resolved, err := managers[0].TaskMCPConfig(ctx, m)
+					var resolved *db.MCPServer
+					var err error
+					if agent.RunInfoFrom(ctx).TaskID > 0 {
+						resolved, err = managers[0].TaskMCPConfig(ctx, m)
+					} else {
+						resolved, err = managedBrowserConfig(m)
+					}
 					if err != nil {
 						// 只返回明确错误工具，绝不启动未解析的共享浏览器配置。
 						for _, closer := range closers {
@@ -190,6 +208,22 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 		}
 		return extra, def, cleanup
 	}
+}
+
+func managedBrowserConfig(original *db.MCPServer) (*db.MCPServer, error) {
+	if original == nil || original.Name != browserMCPName || os.Getenv("ARTEX_PLAYWRIGHT_ROOT") == "" {
+		return original, nil
+	}
+	copy := *original
+	if copy.Transport != "stdio" {
+		return nil, errors.New("浏览器运行时要求独立 stdio")
+	}
+	args := jsonStrSlice(copy.Args)
+	if copy.Command == "npx" && len(args) > 0 && (args[0] == "@playwright/mcp" || args[0] == "@playwright/mcp@latest") {
+		copy.Command = "playwright-mcp"
+		copy.Args, _ = json.Marshal(args[1:])
+	}
+	return taskBrowserConfig(os.TempDir(), 0, &copy, "", "")
 }
 
 func idSet(ids []int64) map[int64]bool {

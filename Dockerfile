@@ -53,20 +53,23 @@ ENV npm_config_registry=$NPM_REGISTRY
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates ripgrep curl wget vim git jq unzip \
+      ca-certificates ripgrep curl wget vim git jq unzip ffmpeg \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
-# 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
-# @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
-# @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
-# 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
-# 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
-RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
-    && playwright-cli --help \
-    && playwright install --with-deps chromium \
+# CLI、MCP 和浏览器固定为同一依赖图；默认浏览器配置由任务包装器注入。
+# 页面更新后的程序也携带相同锁文件，可在容器数据目录补齐工具包。
+COPY runtime/playwright/package*.json /opt/artex-playwright/
+RUN npm ci --prefix /opt/artex-playwright --ignore-scripts \
+    && /opt/artex-playwright/node_modules/.bin/playwright install --with-deps chromium ffmpeg \
+    && ln -s /opt/artex-playwright/node_modules/.bin/playwright /usr/local/bin/playwright \
+    && ln -s /opt/artex-playwright/node_modules/.bin/playwright-mcp /usr/local/bin/playwright-mcp \
     && rm -rf /var/lib/apt/lists/*
+COPY runtime/playwright/playwright-cli.mjs /usr/local/bin/artex-playwright-cli
+RUN chmod 0755 /usr/local/bin/artex-playwright-cli \
+    && ln -s /usr/local/bin/artex-playwright-cli /usr/local/bin/playwright-cli \
+    && playwright-cli --help
 # 固定版本及 SHA256 校验 wgcf/wireproxy，避免运行未验证的工具资产。
 COPY egress/install.py egress/dependencies.json /tmp/wgcf-warp/
 RUN python /tmp/wgcf-warp/install.py "${TARGETARCH}" /usr/local/bin \

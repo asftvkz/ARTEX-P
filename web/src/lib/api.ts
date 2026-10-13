@@ -960,8 +960,9 @@ export const api = {
       `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,
       { signal },
     ),
-  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
-    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg }),
+  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number,
+    followup?: { intent_id: number; mode: "question" | "execute" }) =>
+    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg, followup }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // 方式1 文件上传:落到会话/任务工作目录 uploads/，返回可供 agent Read 的相对路径。
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {

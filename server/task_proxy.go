@@ -231,6 +231,28 @@ func (m *Manager) TaskToolProxy(ctx context.Context, t *Task) (addr, ca string, 
 		}
 		return route.ProxyAddr(), m.traffic.CACertPath(), nil
 	}
+	// Chromium 不支持 SOCKS 账号认证；工具统一使用任务独立认证桥，仍固定原出口。
+	if t != nil && addr != "" {
+		u, parseErr := egress.ProxyURL(addr)
+		if parseErr != nil {
+			return "", "", parseErr
+		}
+		if u.Scheme == "socks5" || u.Scheme == "https" {
+			rt.mu.Lock()
+			bridge := rt.bridges[t.ID]
+			if bridge == nil {
+				bridge, err = egress.NewHTTPBridge(addr)
+				if err == nil {
+					rt.bridges[t.ID] = bridge
+				}
+			}
+			rt.mu.Unlock()
+			if err != nil {
+				return "", "", err
+			}
+			addr = bridge.ProxyAddr()
+		}
+	}
 	return addr, "", nil
 }
 

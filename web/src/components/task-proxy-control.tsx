@@ -249,7 +249,7 @@ export function TaskProxyControl({
                   <ChevronsUpDownIcon className="ml-2 size-4 shrink-0" />
                 </Button>
               </PopoverTrigger>
-              <PopoverContent align="start" className="w-[var(--radix-popover-trigger-width)] p-0">
+              <PopoverContent align="start" className="z-[60] w-[var(--radix-popover-trigger-width)] p-0">
                 <Command>
                   <CommandInput placeholder="搜索名称、类型、编号或出口 IP…" />
                   <CommandList>

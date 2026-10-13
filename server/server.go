@@ -3874,6 +3874,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		Message     string           `json:"message"`
 		Attachments []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对任务工作目录)
 		Seg         *int             `json:"seg,omitempty"`         // 目标主会话分段;缺省=最新段
+		Followup    *taskFollowup    `json:"followup,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -3882,6 +3883,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	agentMessage, ok := s.prepareChatMentionMessage(w, req.Message)
 	if !ok {
 		return
+	}
+	continuation, err := taskFollowupContext(t, req.Followup)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if continuation != "" {
+		agentMessage = continuation + "\n用户的新问题：\n" + agentMessage
 	}
 	// Admission is serialized with deletion's chat cancellation. Mark every chat
 	// turn busy before its first activity/file write, including rule-mode turns.
@@ -3898,6 +3907,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, cancel := context.WithCancelCause(s.ctx)
+	if req.Followup != nil && req.Followup.Mode == "question" {
+		ctx = agent.WithResultQuestion(ctx)
+	}
 	ctx, finishOperation, admitted := s.engine.beginTaskOperationContext(ctx, t.ID)
 	if !admitted {
 		s.chatMu.Unlock()
@@ -3975,7 +3987,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm"})
 		return
 	}
-	reply := s.fallbackChat(t, req.Message)
+	var reply string
+	if req.Followup != nil && req.Followup.Mode == "question" {
+		reply = "当前未配置可用模型，暂不能解释这次结果。原 Worker 的记录已保留；配置模型后可在本任务继续追问。"
+	} else if req.Followup != nil && req.Followup.Mode == "execute" {
+		reply = s.fallbackChat(t, "意图 "+req.Message) + "\n当前未配置可用模型，配置后可继续执行；原记录已保留。"
+	} else {
+		reply = s.fallbackChat(t, req.Message)
+	}
 	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
 	s.finishTaskChat(t.ID, cancel)
 	finishOperation()
