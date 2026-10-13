@@ -61,6 +61,10 @@ func ResolvePaths() (Paths, error) {
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
 	}
+	return pathsForExecutable(exe), nil
+}
+
+func pathsForExecutable(exe string) Paths {
 	dir := filepath.Dir(exe)
 	name := filepath.Base(exe)
 	ext := filepath.Ext(name) // Windows 上是 ".exe"，Unix 上通常为空
@@ -74,15 +78,16 @@ func ResolvePaths() (Paths, error) {
 		Sum:     join(".new") + ".sha256",
 		Old:     join(".old"),
 		Marker:  filepath.Join(dir, stem+".upgrade.json"),
-	}, nil
+	}
 }
 
 // marker 记录一次换装的进度，用来在新版起不来时触发自动回滚。
 type marker struct {
-	From     string `json:"from"`     // 升级前的版本
-	To       string `json:"to"`       // 目标版本
-	Attempts int    `json:"attempts"` // 换装后已尝试启动的次数
-	StagedAt int64  `json:"staged_at"`
+	From      string `json:"from"`     // 升级前的版本
+	To        string `json:"to"`       // 目标版本
+	Attempts  int    `json:"attempts"` // 换装后已尝试启动的次数
+	StagedAt  int64  `json:"staged_at"`
+	Preparing bool   `json:"preparing,omitempty"` // 标记已持久化，但暂存提交尚未完成
 }
 
 func readMarker(path string) (marker, bool) {
@@ -102,7 +107,7 @@ func writeMarker(path string, m marker) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return atomicText(path, string(b))
 }
 
 // cleanStaged 清掉暂存件。换装成功、校验失败、用户取消都走它，避免残留的

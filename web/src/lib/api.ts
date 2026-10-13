@@ -1440,7 +1440,17 @@ export const api = {
   // 顶栏每次整页加载都会查一次，不缓存会很快耗光配额）。force=true 强制回源，
   // 留给用户显式点「检查更新」时用。
   checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=1" : ""}`),
+  updateStatus: async (): Promise<import("./types").UpdateStatus> => {
+    try {
+      return await get<import("./types").UpdateStatus>(`/update/status`);
+    } catch (error) {
+      // 主动回滚的旧版本可能没有状态接口；只对明确的 404 兼容健康接口。
+      if (!(error instanceof APIError) || error.status !== 404) throw error;
+      const health = await get<{ version: string }>(`/health`);
+      return { current: health.version, pending: false, running: false, rolled_back: false };
+    }
+  },
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
-  rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+  rollbackUpdate: () => post<{ ok: boolean; target?: string }>(`/update/rollback`),
 };

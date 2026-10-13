@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -34,7 +35,38 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
 		return "", false
 	}
+	if workspaceRuntimePath(abs) {
+		return "", false
+	}
 	return abs, true
+}
+
+// 持久化程序属于更新器，不允许作为任务文件浏览、下载或改写。
+func workspaceRuntimePath(abs string) bool {
+	root := os.Getenv("ARTEX_SELFUPDATE_ROOT")
+	if root == "" {
+		return false
+	}
+	root = filepath.Clean(root)
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	resolved := abs
+	for ancestor := abs; ; ancestor = filepath.Dir(ancestor) {
+		if real, err := filepath.EvalSymlinks(ancestor); err == nil {
+			rel, _ := filepath.Rel(ancestor, abs)
+			resolved = filepath.Join(real, rel)
+			break
+		}
+		if filepath.Dir(ancestor) == ancestor {
+			break
+		}
+	}
+	if runtime.GOOS == "windows" {
+		root = strings.ToLower(root)
+		resolved = strings.ToLower(resolved)
+	}
+	return resolved == root || strings.HasPrefix(resolved, root+string(os.PathSeparator))
 }
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
@@ -78,6 +110,9 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]wsEntry, 0, len(ents))
 	for _, e := range ents {
+		if workspaceRuntimePath(filepath.Join(abs, e.Name())) {
+			continue
+		}
 		info, err := e.Info()
 		if err != nil {
 			continue

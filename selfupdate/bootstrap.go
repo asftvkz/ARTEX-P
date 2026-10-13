@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -56,14 +58,44 @@ func Bootstrap() (Action, State) {
 		log.Printf("[update] 跳过自举：%v", err)
 		return Continue, State{}
 	}
+	return bootstrap(p)
+}
 
+func bootstrap(p Paths) (Action, State) {
 	if _, err := os.Stat(p.New); err == nil {
 		return applyStaged(p)
 	}
 
 	m, ok := readMarker(p.Marker)
 	if !ok {
+		if b, err := os.ReadFile(filepath.Join(p.Dir, "notice.json")); err == nil {
+			var st State
+			if json.Unmarshal(b, &st) == nil {
+				return Continue, st
+			}
+		}
 		return Continue, State{}
+	}
+	if m.Preparing {
+		// 崩溃可能发生在标记写入后或二进制 rename 后；用暂存校验和区分。
+		want, err := os.ReadFile(p.Sum)
+		got, hashErr := fileSHA256(p.Current)
+		if err != nil || hashErr != nil || !strings.EqualFold(strings.TrimSpace(string(want)), got) {
+			cleanStaged(p)
+			_ = os.Remove(p.Marker)
+			return Continue, State{FailedStage: true, Detail: "更新暂存被中断，继续运行当前版本"}
+		}
+		m.Preparing = false
+		if err := atomicText(p.Old+".version", m.From); err != nil {
+			return Continue, State{Pending: true, Detail: err.Error()}
+		}
+		if err := atomicText(p.Current+".version", m.To); err != nil {
+			return Continue, State{Pending: true, Detail: err.Error()}
+		}
+		if err := writeMarker(p.Marker, m); err != nil {
+			return Continue, State{Detail: "无法保存更新确认状态"}
+		}
+		_ = os.Remove(p.Sum)
 	}
 	return confirmOrRollback(p, m)
 }
@@ -92,6 +124,7 @@ func applyStaged(p Paths) (Action, State) {
 
 	// 换装成功。保留标记，交给下一次启动（跑的就是新版）确认是否稳定。
 	m.Attempts = 0
+	m.Preparing = false
 	if m.StagedAt == 0 {
 		m.StagedAt = time.Now().Unix()
 	}
@@ -119,6 +152,7 @@ func confirmOrRollback(p Paths, m marker) (Action, State) {
 		}
 		log.Printf("[update] 新版本连续 %d 次启动失败，已回滚到 %s，退出以重启（exit %d）",
 			maxAttempts, orUnknown(m.From), ExitRestart)
+		_ = saveContainerNotice(p.Dir, State{RolledBack: true, Detail: fmt.Sprintf("新版本启动失败，已回滚到 %s", orUnknown(m.From))})
 		_ = os.Remove(p.Marker)
 		return Restart, State{RolledBack: true, Detail: fmt.Sprintf("新版本启动失败，已回滚到 %s", orUnknown(m.From))}
 	}
@@ -202,6 +236,7 @@ func smokeTest(bin string) error {
 // Unix 和 Windows 都允许 rename 一个正在运行的可执行文件（Windows 禁止的是删除和
 // 覆盖，rename 不在其列），所以这里不需要分平台，也不需要先停掉自己。
 func swap(p Paths) error {
+	m, _ := readMarker(p.Marker)
 	// Windows 的 rename 不会覆盖已存在的目标，上一轮升级留下的 .old 必须先清掉。
 	if err := os.Remove(p.Old); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("清理旧备份 %s: %w", p.Old, err)
@@ -215,6 +250,21 @@ func swap(p Paths) error {
 			return fmt.Errorf("装入新版本失败(%v)，且恢复当前版本失败: %w", err, rerr)
 		}
 		return fmt.Errorf("装入新版本: %w", err)
+	}
+	if m.To != "" {
+		if err := atomicText(p.Old+".version", m.From); err != nil {
+			_ = rollback(p)
+			return fmt.Errorf("写入备份版本失败: %w", err)
+		}
+		if err := atomicText(p.Current+".version", m.To); err != nil {
+			_ = rollback(p)
+			return fmt.Errorf("写入运行版本失败: %w", err)
+		}
+	}
+	m.Preparing = false
+	if err := writeMarker(p.Marker, m); err != nil {
+		_ = rollback(p)
+		return fmt.Errorf("提交换装状态失败: %w", err)
 	}
 	_ = os.Remove(p.Sum)
 	return nil
@@ -232,7 +282,11 @@ func rollback(p Paths) error {
 		return fmt.Errorf("移走失败的版本: %w", err)
 	}
 	if err := os.Rename(p.Old, p.Current); err != nil {
+		_ = os.Rename(failed, p.Current)
 		return fmt.Errorf("恢复旧版本: %w", err)
+	}
+	if previous := readVersion(p.Old + ".version"); previous != "" {
+		return atomicText(p.Current+".version", previous)
 	}
 	return nil
 }
@@ -244,6 +298,10 @@ func Rollback() error {
 	if err != nil {
 		return err
 	}
+	return manualRollback(p)
+}
+
+func manualRollback(p Paths) error {
 	if _, err := os.Stat(p.Old); err != nil {
 		return errors.New("没有可回滚的上一版本（" + p.Old + " 不存在）")
 	}
@@ -251,6 +309,7 @@ func Rollback() error {
 	if err := smokeTest(p.Old); err != nil {
 		return fmt.Errorf("上一版本无法执行，拒绝回滚: %w", err)
 	}
+	currentVersion, previousVersion := readVersion(p.Current+".version"), readVersion(p.Old+".version")
 	// 交换当前与备份：回滚之后还能再滚回来。
 	tmp := p.Current + ".swap"
 	_ = os.Remove(tmp)
@@ -265,6 +324,15 @@ func Rollback() error {
 		log.Printf("[update] 回滚后整理备份失败（不影响运行）：%v", err)
 	}
 	_ = os.Remove(p.Marker)
+	if previousVersion != "" {
+		if err := atomicText(p.Current+".version", previousVersion); err != nil {
+			return err
+		}
+		if err := atomicText(p.Old+".version", currentVersion); err != nil {
+			return err
+		}
+	}
+	_ = os.Remove(filepath.Join(p.Dir, "notice.json"))
 	return nil
 }
 
@@ -276,6 +344,15 @@ func HasBackup() bool {
 	}
 	_, err = os.Stat(p.Old)
 	return err == nil
+}
+
+// BackupVersion 返回备份的版本；历史备份没有记录时为空。
+func BackupVersion() string {
+	p, err := ResolvePaths()
+	if err != nil {
+		return ""
+	}
+	return readVersion(p.Old + ".version")
 }
 
 func fileSHA256(path string) (string, error) {

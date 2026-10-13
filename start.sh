@@ -20,8 +20,8 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
-BIN=./artex
-[ -x "$BIN" ] || { echo "[artex] 找不到可执行文件 $BIN" >&2; exit 1; }
+IMAGE_BIN="$(pwd)/artex"
+[ -x "$IMAGE_BIN" ] || { echo "[artex] 找不到可执行文件 $IMAGE_BIN" >&2; exit 1; }
 
 RESTART_CODE=75
 MAX_DELAY=60
@@ -44,6 +44,11 @@ trap forward INT TERM
 
 delay=1
 while :; do
+	BIN="$IMAGE_BIN"
+	if [ -n "${ARTEX_SELFUPDATE_ROOT:-}" ]; then
+		# 更新目录在数据卷内；由镜像程序选版本，坏的新程序也能被恢复。
+		BIN="$("$IMAGE_BIN" -selfupdate-select)" || exit 1
+	fi
 	"$BIN" "$@" &
 	child=$!
 

@@ -6,6 +6,19 @@ import (
 	"testing"
 )
 
+func TestBaseDirPinnedAcrossPersistentUpdate(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ARTEX_BASE_DIR", root)
+	if got := BaseDir(); got != root {
+		t.Fatalf("切换程序位置改变了配置根: %s", got)
+	}
+	t.Setenv("ARTEX_SKILL_DIR", "")
+	t.Setenv("ARTEX_CONFIG", filepath.Join(root, "missing.json"))
+	if got := SkillDir(); got != filepath.Join(root, "skills") {
+		t.Fatalf("skill根变化: %s", got)
+	}
+}
+
 func TestPostgresDSNPrecedence(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")

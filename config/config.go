@@ -41,6 +41,10 @@ type Config struct {
 // current working directory so dev artifacts (data/, transcripts) and config
 // resolve against the project dir, not the throwaway binary's location.
 func BaseDir() string {
+	// 容器内程序会切换到数据卷；配置、密钥和业务目录必须保持原根目录。
+	if root := strings.TrimSpace(os.Getenv("ARTEX_BASE_DIR")); root != "" {
+		return root
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return "."

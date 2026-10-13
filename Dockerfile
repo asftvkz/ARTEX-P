@@ -84,6 +84,7 @@ COPY skills/ /app/skills/
 # data/（SQLite + jwt.key）持久化点
 VOLUME ["/app/data", "/app/proxy-secrets"]
 ENV ARTEX_PROXY_SECRETS_FILE=/app/proxy-secrets/key
+ENV ARTEX_BASE_DIR=/app ARTEX_SELFUPDATE_ROOT=/app/data/self-update
 EXPOSE 8787 8788
 ENTRYPOINT ["/app/start.sh"]
 CMD ["-addr", ":8787", "-proxy", ":8788"]

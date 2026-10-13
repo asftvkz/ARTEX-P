@@ -1687,7 +1687,7 @@ export interface FindingTrafficDetail {
 export interface UpdateCheck {
   /** 当前运行的版本；开发构建为 "dev" 或 git describe 的带后缀形式。 */
   current: string;
-  /** 运行形态。docker 下换装只作用于容器可写层，重建容器会退回镜像版本。 */
+  /** Docker 程序版本保存在数据卷，重建容器后仍保留。 */
   mode: "docker" | "binary";
   os: string;
   arch: string;
@@ -1697,6 +1697,8 @@ export interface UpdateCheck {
   /** 本次启动时自更新自举的结论（换装失败 / 已回滚等），无事发生时为空。 */
   boot_notice?: string;
   rolled_back?: boolean;
+  update_pending?: boolean;
+  persistent_update?: boolean;
   /** 查询 GitHub 失败时给出原因，此时下面的字段都不会有。 */
   error?: string;
   latest?: string;
@@ -1722,6 +1724,19 @@ export interface UpdateProgress {
   message: string;
   version?: string;
   error?: string;
+}
+
+/** 不访问 GitHub 的实时更新状态，进程重启后仍读取持久确认标记。 */
+export interface UpdateStatus {
+  current: string;
+  pending: boolean;
+  running: boolean;
+  rolled_back: boolean;
+  message?: string;
+  phase?: UpdateProgress["phase"];
+  percent?: number;
+  error?: string;
+  version?: string;
 }
 
 // Original execution selected from an approval, never submitted to the reviewer.

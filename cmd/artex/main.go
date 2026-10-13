@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -53,11 +54,26 @@ func main() {
 
 func run() int {
 	var (
-		addr    = flag.String("addr", ":8787", "HTTP listen address")
-		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
-		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		addr          = flag.String("addr", ":8787", "HTTP listen address")
+		dataDir       = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
+		proxy         = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		selectRuntime = flag.Bool("selfupdate-select", false, "选择容器数据卷中的程序（启动器使用）")
 	)
 	flag.Parse()
+	if *selectRuntime {
+		image, err := os.Executable()
+		if err != nil {
+			log.Print(err)
+			return 1
+		}
+		bin, err := selfupdate.PrepareContainerRuntime(os.Getenv("ARTEX_SELFUPDATE_ROOT"), image, version)
+		if err != nil {
+			log.Printf("选择持久化程序失败: %v", err)
+			return 1
+		}
+		fmt.Println(bin)
+		return 0
+	}
 
 	// hand the build version to the server package so GET /api/health can report it
 	// to the frontend top bar.
@@ -120,12 +136,6 @@ func run() int {
 	}
 	defer mgr.CloseProxyRuntime()
 
-	// Surviving this long means a freshly swapped-in build actually works, so drop
-	// the upgrade marker and stop counting attempts. Until it fires, every boot
-	// increments the count and a build that keeps dying gets rolled back.
-	settle := time.AfterFunc(selfupdate.SettleDelay, selfupdate.Settle)
-	defer settle.Stop()
-
 	skillDir := config.SkillDir()
 	if abs, err := filepath.Abs(skillDir); err == nil {
 		skillDir = abs
@@ -137,10 +147,19 @@ func run() int {
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Printf("HTTP 监听失败: %v", err)
+		return 1
+	}
+	defer listener.Close()
+	// 成功监听后才开始稳定确认，初始化耗时不能提前消耗确认窗口。
+	settle := time.AfterFunc(selfupdate.SettleDelay, selfupdate.Settle)
+	defer settle.Stop()
 
 	go func() {
 		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}
 	}()
