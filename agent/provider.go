@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"net/http"
 	"net/url"
@@ -77,6 +78,9 @@ type Config struct {
 	// Retry 是该配置解析后的重试参数(profile 覆盖 → 全局策略 → 内置默认,由
 	// server 侧解析)。三层的含义见 RetryConfig;零值 = 完全沿用内置默认。
 	Retry RetryConfig
+	// HTTP 等待保护；零值按进程环境配置解析，默认响应头 60 秒、正文读空闲 120 秒。
+	ResponseHeaderTimeout   time.Duration
+	ResponseBodyIdleTimeout time.Duration
 }
 
 // RetryConfig 是随一个 LLM 配置走的重试参数。每层的「次数」统一语义:
@@ -254,7 +258,7 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
+	client, err := quotaAwareHTTPClientWithTimeouts(c.Proxy, c.SessionHeaderKey, c.ResponseHeaderTimeout, c.ResponseBodyIdleTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +284,31 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
 		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
 	}
-	return llm.NewProvider(lc)
+	provider, err := llm.NewProvider(lc)
+	if err != nil {
+		return nil, err
+	}
+	return &managedHTTPProvider{inner: provider, client: client}, nil
+}
+
+// 主体切换前后关闭旧空闲连接；活动连接仍由请求与真实返回控制。
+type managedHTTPProvider struct {
+	inner  llm.Provider
+	client *http.Client
+}
+
+func (p *managedHTTPProvider) CloseIdleConnections() { p.client.CloseIdleConnections() }
+func (p *managedHTTPProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	return p.inner.Complete(ctx, req)
+}
+func (p *managedHTTPProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return p.inner.Stream(ctx, req)
+}
+func ProviderCloseIdle(provider llm.Provider) func() {
+	if p, ok := provider.(interface{ CloseIdleConnections() }); ok {
+		return p.CloseIdleConnections
+	}
+	return nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,
@@ -335,6 +363,12 @@ type quotaAwareTransport struct {
 	sessionHeaderKey string
 }
 
+func (t quotaAwareTransport) CloseIdleConnections() {
+	if c, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
@@ -369,7 +403,7 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 	if readErr != nil {
-		return resp, nil
+		return nil, readErr
 	}
 	if IsQuotaExhaustedMessage(string(body)) {
 		resp.StatusCode = http.StatusPaymentRequired
@@ -398,7 +432,15 @@ func requestBodySnapshot(req *http.Request) string {
 }
 
 func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
+	return quotaAwareHTTPClientWithTimeouts(proxy, sessionHeaderKey, 0, 0)
+}
+
+func quotaAwareHTTPClientWithTimeouts(proxy, sessionHeaderKey string, headerTimeout, bodyIdle time.Duration) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	headerTimeout = configuredTimeout(headerTimeout, "ARTEX_LLM_RESPONSE_HEADER_TIMEOUT", defaultLLMResponseHeaderTimeout)
+	bodyIdle = configuredTimeout(bodyIdle, "ARTEX_LLM_RESPONSE_BODY_IDLE_TIMEOUT", defaultLLMResponseBodyIdleTimeout)
+	transport.ResponseHeaderTimeout = headerTimeout
+	transport.DisableCompression = true // 在空闲计时包装外侧解压，计时以网络字节为准。
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
 		transport.Proxy = nil // 留空=直连,不回退 HTTP_PROXY/HTTPS_PROXY 环境变量
@@ -416,7 +458,8 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	bounded := responseTimeoutTransport{base: transport, headerTimeout: headerTimeout, bodyIdle: bodyIdle}
+	return &http.Client{Transport: quotaAwareTransport{base: bounded, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a

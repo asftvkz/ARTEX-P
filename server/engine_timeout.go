@@ -70,6 +70,10 @@ func (e taskOperationAdmissionError) Error() string {
 }
 
 func (e *Engine) beginTaskOperationError(ctx context.Context, taskID string) error {
+	return e.beginTaskOperationState(ctx, taskID, nil)
+}
+
+func (e *Engine) beginTaskOperationState(ctx context.Context, taskID string, admitted *db.TaskProxyState) error {
 	b := e.proxyBarrier(taskID)
 	b.mu.Lock()
 	for b.releasing {
@@ -101,14 +105,17 @@ func (e *Engine) beginTaskOperationError(ctx context.Context, taskID string) err
 			log.Printf("[proxy] 任务 %s 操作准入失败: %v", taskID, err)
 			return taskOperationAdmissionError{cause: err}
 		}
+		if admitted != nil {
+			*admitted = state
+		}
 		if task, ok := e.m.Task(taskID); ok {
 			if err = e.m.refreshTaskProxyState(task, state); err != nil {
-				_ = e.m.pg.ReleaseTaskOperation(id)
+				_ = e.m.pg.ReleaseTaskOperationToken(id, state.OperationToken)
 				return taskOperationAdmissionError{cause: err}
 			}
 		}
 		if err := ctx.Err(); err != nil {
-			if releaseErr := e.m.pg.ReleaseTaskOperation(id); releaseErr != nil {
+			if releaseErr := e.m.pg.ReleaseTaskOperationToken(id, state.OperationToken); releaseErr != nil {
 				log.Printf("[proxy] 任务 %s 已取消准入的占用解除失败: %v", taskID, releaseErr)
 			}
 			return err
@@ -119,13 +126,21 @@ func (e *Engine) beginTaskOperationError(ctx context.Context, taskID string) err
 }
 
 func (e *Engine) decInflight(taskID string) {
+	e.decInflightToken(taskID, "")
+}
+
+func (e *Engine) decInflightToken(taskID, token string) {
 	b := e.proxyBarrier(taskID)
 	b.mu.Lock()
 	if e.m != nil && e.m.pg != nil {
 		id, err := strconv.ParseInt(taskID, 10, 64)
 		if err == nil {
-			if err = e.m.pg.ReleaseTaskOperation(id); err != nil {
+			if err = e.m.pg.ReleaseTaskOperationToken(id, token); err != nil {
 				log.Printf("[proxy] 任务 %s 操作占用解除失败: %v", taskID, err)
+				if errors.Is(err, db.ErrProxyActivityToken) {
+					b.mu.Unlock()
+					return
+				}
 			}
 		}
 	}
@@ -310,11 +325,23 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 // task-timeout planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
 func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
+	plannerExited, runErr := e.beginPlannerRun(t.ID, true)
+	if runErr != nil {
+		if !errors.Is(runErr, db.ErrPlannerRunBusy) {
+			log.Printf("[deadline] task %s 终局 Planner 准入失败: %v", t.ID, runErr)
+		}
+		return false
+	}
+	var plannerErr error
+	finishOperation := func() {}
+	defer func() {
+		finishPlannerRun(t.ID, plannerErr, finishOperation, plannerExited)
+	}()
 	opCtx, finish, admitted := e.beginTaskOperationContext(ctx, t.ID)
 	if !admitted {
 		return false
 	}
-	defer finish()
+	finishOperation = finish
 	planner, _ := e.snapshotFor(t, opCtx)
 	for planner == nil {
 		if sleepCtx(ctx, deadlinePollInterval) {
@@ -336,6 +363,7 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)
+	plannerErr = err
 	e.EndLLMCall(t.ID)
 	if err != nil {
 		log.Printf("[deadline] task %s 终局规划出错: %v", t.ID, err)

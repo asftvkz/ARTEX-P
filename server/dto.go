@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -17,6 +18,38 @@ import (
 // the canonical contracts; this file maps one onto the other.
 
 func i64s(v int64) string { return strconv.FormatInt(v, 10) }
+
+// proxyIDInput 精确接收代理中心 ID：旧客户端可继续发送 JSON number，
+// 新客户端发送十进制字符串；两种形式都不会经过 float64 舍入。
+type proxyIDInput int64
+
+func (v *proxyIDInput) UnmarshalJSON(raw []byte) error {
+	if string(raw) == "null" {
+		return nil
+	}
+	var text string
+	if len(raw) > 0 && raw[0] == '"' {
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return err
+		}
+	} else {
+		text = string(raw)
+	}
+	id, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || id <= 0 || i64s(id) != text {
+		return fmt.Errorf("invalid proxy id")
+	}
+	*v = proxyIDInput(id)
+	return nil
+}
+
+func (v *proxyIDInput) Int64() *int64 {
+	if v == nil {
+		return nil
+	}
+	id := int64(*v)
+	return &id
+}
 
 func rfc3339(t time.Time) string { return t.Format(time.RFC3339) }
 
@@ -72,24 +105,25 @@ type TaskDTO struct {
 }
 
 type ProxyDTO struct {
-	WarpPhase          string       `json:"warp_phase,omitempty"`
-	EgressIP           string       `json:"egress_ip,omitempty"`
-	Protocol           string       `json:"protocol"`
-	HasPassword        bool         `json:"has_password"`
-	HasResinAdminToken bool         `json:"has_resin_admin_token"`
-	ID                 int64        `json:"id"`
-	Name               string       `json:"name"`
-	Kind               db.ProxyKind `json:"kind"`
-	URL                string       `json:"url,omitempty"`
-	Host               string       `json:"host,omitempty"`
-	Port               int          `json:"port,omitempty"`
-	Username           string       `json:"username,omitempty"`
-	ResinPlatform      string       `json:"resin_platform,omitempty"`
-	ResinAdminURL      string       `json:"resin_admin_url,omitempty"`
-	Enabled            bool         `json:"enabled"`
-	Status             string       `json:"status"`
-	LastError          string       `json:"last_error,omitempty"`
-	LastCheckedAt      string       `json:"last_checked_at,omitempty"`
+	WarpHealth         *WarpHealthDTO `json:"warp_health,omitempty"`
+	WarpPhase          string         `json:"warp_phase,omitempty"`
+	EgressIP           string         `json:"egress_ip,omitempty"`
+	Protocol           string         `json:"protocol"`
+	HasPassword        bool           `json:"has_password"`
+	HasResinAdminToken bool           `json:"has_resin_admin_token"`
+	ID                 string         `json:"id"`
+	Name               string         `json:"name"`
+	Kind               db.ProxyKind   `json:"kind"`
+	URL                string         `json:"url,omitempty"`
+	Host               string         `json:"host,omitempty"`
+	Port               int            `json:"port,omitempty"`
+	Username           string         `json:"username,omitempty"`
+	ResinPlatform      string         `json:"resin_platform,omitempty"`
+	ResinAdminURL      string         `json:"resin_admin_url,omitempty"`
+	Enabled            bool           `json:"enabled"`
+	Status             string         `json:"status"`
+	LastError          string         `json:"last_error,omitempty"`
+	LastCheckedAt      string         `json:"last_checked_at,omitempty"`
 }
 
 func proxyDTO(p *db.Proxy) *ProxyDTO {
@@ -97,7 +131,7 @@ func proxyDTO(p *db.Proxy) *ProxyDTO {
 		return nil
 	}
 	protocol, hasPassword := proxyCredentialFlags(p.Protocol, p.URL, p.Password)
-	return &ProxyDTO{Protocol: protocol, HasPassword: hasPassword, HasResinAdminToken: p.ResinAdminToken != "", ID: p.ID, Name: p.Name, Kind: p.Kind, URL: maskProxyURL(p.URL), Host: p.Host, Port: p.Port, Username: p.Username, ResinPlatform: p.ResinPlatform, ResinAdminURL: maskProxyURL(p.ResinAdminURL), Enabled: p.Enabled, Status: p.Status, LastError: p.LastError, LastCheckedAt: func() string {
+	return &ProxyDTO{Protocol: protocol, HasPassword: hasPassword, HasResinAdminToken: p.ResinAdminToken != "", ID: i64s(p.ID), Name: p.Name, Kind: p.Kind, URL: maskProxyURL(p.URL), Host: p.Host, Port: p.Port, Username: p.Username, ResinPlatform: p.ResinPlatform, ResinAdminURL: maskProxyURL(p.ResinAdminURL), Enabled: p.Enabled, Status: p.Status, LastError: p.LastError, LastCheckedAt: func() string {
 		if p.LastCheckedAt == nil {
 			return ""
 		}
@@ -117,6 +151,12 @@ func (s *Server) runtimeProxyDTO(p *db.Proxy) *ProxyDTO {
 		d.Status, d.WarpPhase = db.ProxyStatusFailed, "failed"
 		return d
 	}
+	if rt.health != nil {
+		if health, healthErr := rt.health.DTO(context.Background(), p.ID); healthErr == nil {
+			d.WarpHealth = health
+			d.EgressIP = health.EgressIP
+		}
+	}
 	profile, err := rt.warp.Get(warpProfileID(p.ID))
 	if err != nil {
 		if p.Status == db.ProxyStatusHealthy || p.Status == db.ProxyStatusFailed {
@@ -127,8 +167,8 @@ func (s *Server) runtimeProxyDTO(p *db.Proxy) *ProxyDTO {
 	d.WarpPhase = profile.Phase
 	switch profile.Phase {
 	case "ready":
-		if p.Enabled && p.Status == db.ProxyStatusHealthy && profile.Desired {
-			d.EgressIP = profile.EgressIP
+		if p.Enabled && p.Status == db.ProxyStatusHealthy && profile.Desired && d.WarpHealth != nil && d.WarpHealth.State == "ready" {
+			d.EgressIP = d.WarpHealth.EgressIP
 		} else {
 			d.Status = db.ProxyStatusFailed
 		}
@@ -257,7 +297,7 @@ func proxySnapshotDTO(s db.ProxySnapshot) *ProxyDTO {
 		return nil
 	}
 	protocol, hasPassword := proxyCredentialFlags(s.Protocol, s.URL, s.Password)
-	return &ProxyDTO{Protocol: protocol, HasPassword: hasPassword, HasResinAdminToken: s.AdminToken != "", ID: s.ID, Name: s.Name, Kind: s.Kind, URL: maskProxyURL(s.URL), Host: s.Host, Port: s.Port, Username: s.Username, ResinPlatform: s.Platform}
+	return &ProxyDTO{Protocol: protocol, HasPassword: hasPassword, HasResinAdminToken: s.AdminToken != "", ID: i64s(s.ID), Name: s.Name, Kind: s.Kind, URL: maskProxyURL(s.URL), Host: s.Host, Port: s.Port, Username: s.Username, ResinPlatform: s.Platform}
 }
 
 // completedRFC renders a unix completion time as RFC3339, or "" when unset (0).

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 
 	"github.com/Autumn-27/artex/db"
@@ -69,7 +70,7 @@ func (m *Manager) confirmTaskLeaseReleased(t *Task) error {
 		return err
 	}
 	var record resinLeaseRecord
-	if json.Unmarshal(b, &record) != nil || record.Snapshot.ID != t.proxyState().Snapshot.ID {
+	if json.Unmarshal(b, &record) != nil || !reflect.DeepEqual(record.Snapshot, t.proxyState().Snapshot) {
 		return db.ErrProxySwitchRecovery
 	}
 	if record.State != "uncertain" && record.State != "releasing" && record.State != "released" {
@@ -95,13 +96,13 @@ func (t *Task) setProxyState(s db.TaskProxyState) {
 }
 
 func (s *Server) registerTaskProxyRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("PUT /api/tasks/{id}/proxy", s.switchTaskProxy)
+	mux.HandleFunc("PUT /api/tasks/{id}/proxy", s.setSubjectProxy)
 	mux.HandleFunc("POST /api/tasks/{id}/proxy/recovery", s.recoverTaskProxy)
 }
 
 type taskProxySwitchRequest struct {
 	Mode     db.TaskProxyMode `json:"proxy_mode"`
-	ID       *int64           `json:"proxy_id"`
+	ID       *proxyIDInput    `json:"proxy_id"`
 	Revision json.RawMessage  `json:"expected_revision"`
 	Action   string           `json:"action"`
 }
@@ -124,11 +125,11 @@ func (s *Server) switchTaskProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	revision, err := parseProxyRevision(req.Revision)
-	if err != nil || (req.Mode != "inherit" && req.Mode != "direct" && req.Mode != "fixed") || (req.Mode == "fixed" && (req.ID == nil || *req.ID <= 0)) || (req.Mode != "fixed" && req.ID != nil) {
+	if err != nil || (req.Mode != "inherit" && req.Mode != "direct" && req.Mode != "fixed") || (req.Mode == "fixed" && req.ID == nil) || (req.Mode != "fixed" && req.ID != nil) {
 		writeJSON(w, 400, map[string]any{"error": "需要有效的代理模式和非负安全整数 expected_revision"})
 		return
 	}
-	row, err := s.m.switchTaskProxy(r.Context(), r.PathValue("id"), revision, req.Mode, req.ID)
+	row, err := s.m.switchTaskProxy(r.Context(), r.PathValue("id"), revision, req.Mode, req.ID.Int64())
 	if err != nil {
 		s.writeProxySwitchError(w, r.PathValue("id"), err)
 		return
@@ -234,6 +235,13 @@ func (m *Manager) recoverTaskProxy(ctx context.Context, id string, expected int6
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil || n <= 0 {
 		return nil, sql.ErrNoRows
+	}
+	policy, err := m.pg.GetProxyPolicy(db.ProxySubject{Kind: "task", ID: n})
+	if err != nil {
+		return nil, err
+	}
+	if policy.State.Mode == db.TaskProxyModeGroup || policy.SwitchToken != "" {
+		return nil, db.ErrProxySwitchRecovery
 	}
 	b := m.taskProxyBarrier(id)
 	b.mu.Lock()

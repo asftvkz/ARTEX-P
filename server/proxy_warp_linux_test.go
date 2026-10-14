@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -68,7 +69,7 @@ func TestWarpToolProcess(t *testing.T) {
 				fmt.Fprintln(os.Stderr, "synthetic-private-token")
 				os.Exit(42)
 			}
-			if err := os.WriteFile(args[1], []byte("synthetic-account"), 0600); err != nil {
+			if err := os.WriteFile(args[1], []byte("private_key = synthetic\naccess_token = synthetic\ndevice_id = synthetic\n"), 0600); err != nil {
 				os.Exit(92)
 			}
 		} else if len(args) == 5 && args[2] == "generate" && args[3] == "--profile" {
@@ -190,7 +191,7 @@ func TestWarpToolProcess(t *testing.T) {
 			if mode == "probe-fail" || failProbe == nil {
 				warp = "off"
 			}
-			body := "ip=198.51.100.42\nwarp=" + warp + "\n"
+			body := "ip=8.8.8.8\nwarp=" + warp + "\n"
 			fmt.Fprintf(secured, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 		}()
 	}
@@ -266,10 +267,7 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 			if nested, ok := out["proxy"].(map[string]any); ok {
 				row = nested
 			}
-			id, ok := row["id"].(float64)
-			if !ok {
-				t.Fatalf("未保留已建proxy DTO: %d %s", code, raw)
-			}
+			id := proxyResponseID(t, row, "id")
 			t.Cleanup(func() {
 				if rt, err := s.m.proxyRuntime(); err == nil {
 					_, _ = rt.warp.Stop(t.Context(), warpProfileID(int64(id)))
@@ -281,19 +279,19 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 			}
 			path := fmt.Sprintf("/api/proxies/%d", int64(id))
 			if mode != "ready" {
-				if out["proxy_id"] != id || row["warp_phase"] != "failed" || row["status"] != "failed" || row["egress_ip"] != nil || strings.Contains(raw, "synthetic-private-token") {
+				if out["proxy_id"] != i64s(id) || row["warp_phase"] != "failed" || row["status"] != "failed" || row["egress_ip"] != nil || strings.Contains(raw, "synthetic-private-token") {
 					t.Fatalf("失败包泄密或丢失状态: %s", raw)
 				}
 				if mode == "register-fail" {
 					for _, action := range []string{"register", "recover"} {
 						c, _, r := proxyAPI(t, mux, "POST", path+"/warp/"+action, `{"accept_terms":true}`)
-						if c != 502 {
-							t.Fatalf("不确定注册可重试: %d %s", c, r)
+						if c != 409 {
+							t.Fatalf("不确定注册未保持人工恢复屏障: %d %s", c, r)
 						}
 					}
 				}
 			} else {
-				if row["status"] != "healthy" || row["warp_phase"] != "ready" || row["egress_ip"] != "198.51.100.42" {
+				if row["status"] != "healthy" || row["warp_phase"] != "ready" || row["egress_ip"] != "8.8.8.8" {
 					t.Fatalf("未返回真实探测IP: %s", raw)
 				}
 				for _, action := range []string{"register", "recover"} {
@@ -313,7 +311,7 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 				found := false
 				for _, v := range listed["proxies"].([]any) {
 					p := v.(map[string]any)
-					if p["id"] == id {
+					if p["id"] == i64s(id) {
 						found = p["egress_ip"] == row["egress_ip"]
 					}
 				}
@@ -326,6 +324,17 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 					t.Fatalf("渠道WARP引用未解析可信出口: %v", err)
 				}
 				task := createRuntimeTask(t, s, db.TaskProxyModeFixed, &proxyID)
+				taskID, _ := strconv.ParseInt(task.ID, 10, 64)
+				activity, err := s.m.pg.AcquireTaskOperation(taskID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				activityReleased := false
+				defer func() {
+					if !activityReleased {
+						_ = s.m.pg.ReleaseTaskOperationToken(taskID, activity.OperationToken)
+					}
+				}()
 				badProbe := filepath.Join(os.Getenv("ARTEX_WARP_DIR"), warpProfileID(proxyID), "synthetic-bad-probe")
 				if err := os.WriteFile(badProbe, []byte("fail"), 0600); err != nil {
 					t.Fatal(err)
@@ -346,6 +355,10 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 				if c != 409 {
 					t.Fatalf("WARP action绕过任务引用屏障: %d %s", c, r)
 				}
+				if err := s.m.pg.ReleaseTaskOperationToken(taskID, activity.OperationToken); err != nil {
+					t.Fatal(err)
+				}
+				activityReleased = true
 				if _, err := s.m.pg.Exec(`UPDATE tasks SET status='done' WHERE id=$1`, task.ID); err != nil {
 					t.Fatal(err)
 				}
@@ -364,16 +377,16 @@ func TestProxyPGWarpOneClick(t *testing.T) {
 			if strings.Count(string(calls), "register\n") != 1 {
 				t.Fatalf("重复注册: %s", calls)
 			}
-			if mode == "ready" && (strings.Count(string(calls), "start\n") != 1 || strings.Count(string(calls), "probe\n") != 2) {
+			if mode == "ready" && (strings.Count(string(calls), "start\n") != 1 || strings.Count(string(calls), "probe\n") != 5) {
 				t.Fatalf("重复启动或漏探测: %s", calls)
 			}
 			if mode == "ready" {
 				c, got, r := proxyAPI(t, mux, "POST", path+"/warp/start", "")
-				if c != 200 || got["egress_ip"] != "198.51.100.42" {
+				if c != 200 || got["egress_ip"] != "8.8.8.8" {
 					t.Fatalf("同ID启动未返回出口: %d %s", c, r)
 				}
 				c, got, r = proxyAPI(t, mux, "POST", path+"/test", "")
-				if c != 200 || got["egress_ip"] != "198.51.100.42" {
+				if c != 200 || got["egress_ip"] != "8.8.8.8" {
 					t.Fatalf("出口重新探测失败: %d %s", c, r)
 				}
 				if err := os.WriteFile(filepath.Join(os.Getenv("ARTEX_WARP_DIR"), warpProfileID(int64(id)), "synthetic-exit"), []byte("exit"), 0600); err != nil {
@@ -410,7 +423,7 @@ func TestProxyPGWarpRuntimeRecovery(t *testing.T) {
 			if code != 201 {
 				t.Fatalf("创建失败: %d %s", code, raw)
 			}
-			id := int64(out["id"].(float64))
+			id := proxyResponseID(t, out, "id")
 			path := fmt.Sprintf("/api/proxies/%d", id)
 			t.Cleanup(func() {
 				if rt, err := s.m.proxyRuntime(); err == nil {
@@ -419,7 +432,13 @@ func TestProxyPGWarpRuntimeRecovery(t *testing.T) {
 				_ = s.m.pg.DeleteProxy(id)
 			})
 			if scenario == "probe-recovery" {
-				createRuntimeTask(t, s, db.TaskProxyModeFixed, &id)
+				task := createRuntimeTask(t, s, db.TaskProxyModeFixed, &id)
+				taskID, _ := strconv.ParseInt(task.ID, 10, 64)
+				activity, err := s.m.pg.AcquireTaskOperation(taskID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = s.m.pg.ReleaseTaskOperationToken(taskID, activity.OperationToken) }()
 				marker := filepath.Join(os.Getenv("ARTEX_WARP_DIR"), warpProfileID(id), "synthetic-bad-probe")
 				if err := os.WriteFile(marker, []byte("fail"), 0600); err != nil {
 					t.Fatal(err)
@@ -432,7 +451,7 @@ func TestProxyPGWarpRuntimeRecovery(t *testing.T) {
 					t.Fatal(err)
 				}
 				code, out, raw = proxyAPI(t, mux, "POST", path+"/test", "")
-				if code != 200 || out["status"] != "healthy" || out["egress_ip"] != "198.51.100.42" {
+				if code != 200 || out["status"] != "healthy" || out["egress_ip"] != "8.8.8.8" {
 					t.Fatalf("存活出口不能原地复探恢复: %d %s", code, raw)
 				}
 				code, _, raw = proxyAPI(t, mux, "POST", path+"/warp/stop", "")
@@ -442,7 +461,7 @@ func TestProxyPGWarpRuntimeRecovery(t *testing.T) {
 			} else if scenario == "repeat-start" {
 				for i := 0; i < 2; i++ {
 					code, out, raw = proxyAPI(t, mux, "POST", path+"/warp/start", "")
-					if code != 200 || out["status"] != "healthy" || out["egress_ip"] != "198.51.100.42" {
+					if code != 200 || out["status"] != "healthy" || out["egress_ip"] != "8.8.8.8" {
 						t.Fatalf("重复start毒化健康出口: %d %s", code, raw)
 					}
 				}
@@ -452,7 +471,7 @@ func TestProxyPGWarpRuntimeRecovery(t *testing.T) {
 					t.Fatalf("未接受条款操作应被拒绝: %d %s", code, raw)
 				}
 				code, out, raw = proxyAPI(t, mux, "GET", path, "")
-				if code != 200 || out["status"] != "healthy" || out["egress_ip"] != "198.51.100.42" {
+				if code != 200 || out["status"] != "healthy" || out["egress_ip"] != "8.8.8.8" {
 					t.Fatalf("被拒绝的操作毒化实际健康状态: %d %s", code, raw)
 				}
 			}
@@ -482,7 +501,7 @@ func TestProxyPGWarpActionSingleConnection(t *testing.T) {
 	if code != 201 {
 		t.Fatalf("创建失败: %d %s", code, raw)
 	}
-	id := int64(out["id"].(float64))
+	id := proxyResponseID(t, out, "id")
 	t.Cleanup(func() {
 		if err := s.m.pg.DeleteProxy(id); err != nil {
 			t.Errorf("清理单连接测试代理: %v", err)
@@ -532,7 +551,7 @@ func TestProxyPGWarpActionSingleConnection(t *testing.T) {
 			if err := json.Unmarshal(data, &dto); err != nil {
 				t.Fatal(err)
 			}
-			if dto.ID != id || (action == "stop" && (dto.Status != "stopped" || dto.EgressIP != "")) || (action == "start" && (dto.Status != "healthy" || dto.EgressIP != "198.51.100.42")) {
+			if dto.ID != i64s(id) || (action == "stop" && (dto.Status != "stopped" || dto.EgressIP != "")) || (action == "start" && (dto.Status != "healthy" || dto.EgressIP != "8.8.8.8")) {
 				t.Fatalf("操作DTO状态错误: %s", data)
 			}
 			if s.m.pg.Stats().WaitCount != before {
@@ -559,7 +578,7 @@ func TestProxyPGWarpChannelDeletePreservesProfile(t *testing.T) {
 	if code != 201 {
 		t.Fatalf("创建失败: %d %s", code, raw)
 	}
-	id := int64(out["id"].(float64))
+	id := proxyResponseID(t, out, "id")
 	path := fmt.Sprintf("/api/proxies/%d", id)
 	t.Cleanup(func() {
 		if rt, err := s.m.proxyRuntime(); err == nil {
@@ -597,7 +616,7 @@ func TestProxyPGWarpChannelDeletePreservesProfile(t *testing.T) {
 	}
 	for _, action := range []string{"start", "recover"} {
 		code, out, raw = proxyAPI(t, mux, "POST", path+"/warp/"+action, "")
-		if code != 200 || out["id"] != float64(id) || out["egress_ip"] != "198.51.100.42" {
+		if code != 200 || out["id"] != i64s(id) || out["egress_ip"] != "8.8.8.8" {
 			t.Fatalf("解绑后原ID不能恢复: %s %d %s", action, code, raw)
 		}
 	}
@@ -633,7 +652,7 @@ func TestProxyPGWarpDeleteRunning(t *testing.T) {
 	if code != 201 {
 		t.Fatalf("创建失败: %d %s", code, raw)
 	}
-	id := int64(out["id"].(float64))
+	id := proxyResponseID(t, out, "id")
 	path := fmt.Sprintf("/api/proxies/%d", id)
 	rt, err := s.m.proxyRuntime()
 	if err != nil {

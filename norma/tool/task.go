@@ -70,9 +70,9 @@ type Task struct {
 	OutputPath  string
 
 	// internal, guarded by Manager.mu
-	backgrounded bool          // surfaced as a background task: notify on exit
-	notified     bool          // completion already enqueued into pending
-	oversize     bool          // terminated by the size watchdog
+	backgrounded bool // surfaced as a background task: notify on exit
+	notified     bool // completion already enqueued into pending
+	oversize     bool // terminated by the size watchdog
 	cmd          *exec.Cmd
 	done         chan struct{} // closed by watch when the process exits
 }
@@ -88,15 +88,15 @@ func (t *Task) info() TaskInfo {
 
 // TaskInfo is an immutable snapshot of a task for safe reads outside the lock.
 type TaskInfo struct {
-	ID          string
-	Kind        TaskKind
-	Command     string
-	Description string
-	Status      TaskStatus
-	ExitCode    int
-	StartTime   time.Time
-	EndTime     time.Time
-	OutputPath  string
+	ID           string
+	Kind         TaskKind
+	Command      string
+	Description  string
+	Status       TaskStatus
+	ExitCode     int
+	StartTime    time.Time
+	EndTime      time.Time
+	OutputPath   string
 	Backgrounded bool
 }
 
@@ -159,9 +159,10 @@ type Manager struct {
 	// interactive PTY shell sessions (see shell_session.go). Separate map + mutex
 	// from the file-based tasks above: sessions are persistent, stdin-driven, and
 	// keep an in-memory ring buffer rather than streaming to a file.
-	sessMu   sync.Mutex
-	sessions map[string]*ptySession
-	sessSeq  int
+	sessMu          sync.Mutex
+	sessions        map[string]*ptySession
+	retiredSessions map[*ptySession]struct{} // kill 已发出但 cmd.Wait/done 尚未确认的会话
+	sessSeq         int
 }
 
 func baseTaskDir() string { return filepath.Join(os.TempDir(), "norma") }
@@ -179,11 +180,12 @@ func NewManager(sessionID string) (*Manager, error) {
 	cleanStaleSessions(baseTaskDir(), sessionID)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		tasks:      map[string]*Task{},
-		sessions:   map[string]*ptySession{},
-		dir:        dir,
-		rootCtx:    ctx,
-		rootCancel: cancel,
+		tasks:           map[string]*Task{},
+		sessions:        map[string]*ptySession{},
+		retiredSessions: map[*ptySession]struct{}{},
+		dir:             dir,
+		rootCtx:         ctx,
+		rootCancel:      cancel,
 	}, nil
 }
 
@@ -265,10 +267,12 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 
 func (m *Manager) watch(t *Task, f *os.File) {
 	stop := make(chan struct{})
-	go m.watchSize(t, stop)
+	sizeDone := make(chan struct{})
+	go func() { defer close(sizeDone); m.watchSize(t, stop) }()
 
 	err := t.cmd.Wait()
 	close(stop)
+	<-sizeDone
 	_ = f.Close()
 
 	m.mu.Lock()
@@ -285,12 +289,12 @@ func (m *Manager) watch(t *Task, f *os.File) {
 		}
 	}
 	t.EndTime = time.Now()
-	close(t.done)
 	if t.backgrounded && !t.notified && (t.Status == TaskCompleted || t.Status == TaskFailed) {
 		t.notified = true
 		m.pending = append(m.pending, m.notifFor(t))
 	}
 	m.mu.Unlock()
+	close(t.done) // output file与状态全部收尾后，才对严格清理方宣告真退出。
 }
 
 // watchSize terminates a task whose output file grows past the cap.
@@ -513,15 +517,41 @@ func (m *Manager) DrainNotifications() []Notification {
 // Cleanup kills all tasks, cancels the root context, and removes the session's
 // task directory. Safe to call on a nil Manager.
 func (m *Manager) Cleanup() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = m.CleanupContext(ctx)
+}
+
+// CleanupContext 只有进程 Wait 及交互 shell 退出后才返回成功；取消不等于退出。
+func (m *Manager) CleanupContext(ctx context.Context) error {
 	if m == nil {
-		return
+		return nil
 	}
+	m.mu.Lock()
+	done := make([]<-chan struct{}, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		done = append(done, task.done)
+	}
+	m.mu.Unlock()
+	m.sessMu.Lock()
+	for _, session := range m.sessions {
+		done = append(done, session.done)
+	}
+	m.sessMu.Unlock()
 	m.KillAll()
 	m.closeAllSessions()
 	if m.rootCancel != nil {
 		m.rootCancel()
 	}
+	for _, exited := range done {
+		select {
+		case <-exited:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>
+	return nil
 }
 
 // tailFile reads the last maxBytes of a file, prefixing a notice when earlier
