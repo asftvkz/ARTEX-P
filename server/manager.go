@@ -1465,11 +1465,25 @@ func (m *Manager) setTaskTerminalGuarded(id, status string, checkGraph bool) (wo
 		return false, err
 	}
 	if checkGraph {
-		won, err = m.pg.CompleteTaskIfIdle(n)
+		var persistedStatus string
+		won, persistedStatus, err = m.pg.CompleteTaskIfIdleStatus(n)
+		if persistedStatus != "" {
+			status = persistedStatus
+		}
 	} else {
 		won, err = m.pg.SetTerminalStatusGuarded(n, status)
 	}
 	if err != nil || !won {
+		if err == nil && checkGraph {
+			if task, ok := m.Task(id); ok {
+				lifecycle := task.lifecycleSnapshot()
+				if !lifecycle.Paused && !lifecycle.Queued && !pgdb.IsTerminal(status) {
+					if open, openErr := task.Store.HasOpenGoal(); openErr == nil && open {
+						task.Notify()
+					}
+				}
+			}
+		}
 		return won, err
 	}
 	m.mu.Lock()

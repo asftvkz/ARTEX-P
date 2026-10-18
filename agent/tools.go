@@ -12,6 +12,14 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
+func flagGoalRequiresPositiveEvidence(payload json.RawMessage) bool {
+	return db.GoalProofRequiresCapturedFlag(payload)
+}
+
+func positiveFlagEvidence(payload json.RawMessage) bool {
+	return db.PositiveFlagEvidence(payload)
+}
+
 // compactIntents distills intents to {id, summary, state, asset_ids, parents,
 // yields} so the planner sees both the direction and its LINEAGE — parents (the
 // upstream nodes it derived from: facts/intents/findings) and yields (the facts/
@@ -1207,8 +1215,15 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
+			if evidenceNode.State != "confirmed" {
+				return actool.Errorf("evidence_id 必须是已确认的事实/漏洞；已驳回或根节点不能证明目标"), nil
+			}
+			if flagGoalRequiresPositiveEvidence(goalNode.Payload) && !positiveFlagEvidence(evidenceNode.Payload) {
+				return actool.Errorf("该目标要求获取 flag；证据没有明确的正向 flag{...}，不能把未发现或权限受限标记为达成"), nil
+			}
+			if err := t.ts.ProveGoal(ev, goal); err != nil {
+				return actool.Errorf(fmt.Sprintf("保存目标证明失败: %v", err)), nil
+			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
@@ -1331,12 +1346,14 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Summary    string            `json:"summary"`
-	Detail     string            `json:"detail"`
-	Evidence   string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	IntentID   json.RawMessage   `json:"intent_id"`
-	AssetIDs   []json.RawMessage `json:"asset_ids"`
+	Summary        string            `json:"summary"`
+	Detail         string            `json:"detail"`
+	Evidence       string            `json:"evidence"`        // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	ObservedOutput string            `json:"observed_output"` // 原样保留的实际响应/命令输出，不含请求参数和命令本身
+	Confidence     string            `json:"confidence"`      // observed（直接看到）| inferred（据现象推断）
+	CapturedFlag   string            `json:"captured_flag"`   // 实际取得的 flag 原值（仅目标成果为 flag 时填写）
+	IntentID       json.RawMessage   `json:"intent_id"`
+	AssetIDs       []json.RawMessage `json:"asset_ids"`
 }
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
@@ -1352,8 +1369,14 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if e := strings.TrimSpace(it.Evidence); e != "" {
 		payload["evidence"] = e
 	}
+	if output := strings.TrimSpace(it.ObservedOutput); output != "" {
+		payload["observed_output"] = output
+	}
 	if c := strings.TrimSpace(it.Confidence); c != "" {
 		payload["confidence"] = c
+	}
+	if f := strings.TrimSpace(it.CapturedFlag); f != "" {
+		payload["captured_flag"] = f
 	}
 	intent := pid(it.IntentID)
 	if intent <= 0 {
@@ -1384,15 +1407,18 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
 		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
 		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
+		"  · 如果本次确实取得 flag，必须把原始 flag 值写入 captured_flag，并把只含实际响应/命令输出（不含命令、请求参数）的原文写入 observed_output；工具会核对两者。只引用 README/格式示例或把 flag 放在请求参数中不能作为目标证明。\n"+
 		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
 		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-			"intent_id":  idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-			"detail":     str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-			"evidence":   str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"confidence": str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+			"facts":           map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":         str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
+			"intent_id":       idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
+			"detail":          str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
+			"evidence":        str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
+			"observed_output": str("若要求获取 flag，填写实际观察到的原始响应/命令输出，不含执行命令、请求参数或说明文字。"),
+			"confidence":      str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
+			"captured_flag":   str("实际从目标输出中取得的完整 flag{...} 原值；仅确实取得时填写，不能填 README/模板示例或推测值。"),
+			"asset_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {

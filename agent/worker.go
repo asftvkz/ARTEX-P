@@ -309,8 +309,12 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	return body + workerFlagEvidencePolicy + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
 }
+
+const workerFlagEvidencePolicy = `
+
+**flag 成果证据格式**：只有实际读到目标返回的 flag 时，record_fact 必须同时填写 captured_flag（原始 flag{...}）和 observed_output（实际响应/命令输出原文，只含输出，不含执行命令、请求参数或解释）；两者必须对应。把 flag 放进请求参数、命令行、README 示例或推测结果都不代表取得。`
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
 // the intent is the worker's whole job. It used to live in the system prompt; it now

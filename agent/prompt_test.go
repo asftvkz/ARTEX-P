@@ -41,6 +41,9 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	if !strings.Contains(got, "中间产物输出规约") || !strings.Contains(got, "/data") {
 		t.Fatalf("plannerSystem missing code-owned artifact tail: %q", got)
 	}
+	if !strings.Contains(got, "代码强制的收尾约束") || !strings.Contains(got, "占位 flag") {
+		t.Fatalf("plannerSystem missing code-owned goal-proof policy: %q", got)
+	}
 
 	// worker dual-text via {{if .ProxyAddr}} in a user template, plus the code tail:
 	// [B] trafficTool present only when RECORDING (caCert set — the MITM is on, so

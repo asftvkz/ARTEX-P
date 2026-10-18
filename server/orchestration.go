@@ -553,6 +553,7 @@ func (s *Server) seedOrchestrationTools() {
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
 	}
 	s.refreshBuiltinToolSchemas()
+	s.refreshFlagEvidenceFields()
 	s.refreshTaskFollowupTools()
 	s.seedAutoDefaultBindings()
 	s.seedPlannerDefaultBindings()
@@ -611,6 +612,35 @@ func (s *Server) refreshBuiltinToolSchemas() {
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
 	log.Printf("[tools] 已刷新 orchestration/platform 工具 schema 到代码默认(一次性)")
+}
+
+// 只补充成果证据字段，保留用户的工具描述、原有参数、绑定和启停选择。
+func (s *Server) refreshFlagEvidenceFields() {
+	const flag = "record_fact_flag_evidence_fields_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "record_fact" {
+			continue
+		}
+		properties, _ := seed.Schema["properties"].(map[string]any)
+		fields, err := json.Marshal(map[string]any{
+			"captured_flag":   properties["captured_flag"],
+			"observed_output": properties["observed_output"],
+		})
+		if err == nil {
+			_, err = s.m.pg.Exec(`UPDATE tools SET schema=jsonb_set(schema,'{properties}',COALESCE(schema->'properties','{}'::jsonb) || $1::jsonb),updated_at=now() WHERE key='record_fact' AND system`, string(fields))
+		}
+		if err != nil {
+			log.Printf("[tools] 成果证据字段更新失败: %v", err)
+			return
+		}
+		if err := s.m.pg.SetSetting(flag, "true"); err != nil {
+			log.Printf("[tools] 成果证据字段版本记录失败: %v", err)
+		}
+		return
+	}
 }
 
 // 只刷新追加入口的说明，不重跑全目录迁移或重新绑定用户禁用的工具。
