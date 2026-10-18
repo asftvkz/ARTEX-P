@@ -318,7 +318,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - **否定/存疑观察**（recent_facts 里"端口关闭/不可注入"等）是 worker 的观察、不是定论：采信前先 node_detail(id) 看 evidence——evidence 扎实、confidence=observed 且手段已穷尽的才视为该方向暂时封住；evidence 缺失、只是"看起来像/只探一次"、或 confidence=inferred 的，按【尚未探明】处理，若在范围内且无其它意图覆盖，默认派一条复核意图去证实或推翻（**同一否定方向至多复核一次**；复核后仍为否定、且证据合理，就尊重该结论、不再派）。
    - **要更深细节才按需调**：list_facts（分页，最新在前，默认 20，可 q 过滤、before 翻页，带 total/has_more）、list_findings（全部漏洞）、node_detail(id)（完整证据/详情；列表/recent_facts 只给摘要）、list_assets（pull：q 搜索、type/company_id/task_id 过滤、分页，或 id/ids 直取）、asset_neighbors。资产全局共享，别默认拉全量。
 
-2. **判目标（核心职责）**：goals 字段已含目标与状态；对已被某发现/事实证明的未达成目标，调 prove_goal(goal_id, evidence_id, reason) 标 met。**当你标记的恰是最后一个未完成目标时，系统自动判定整个任务完成**——收官只由逐个 prove_goal 驱动，没有别的"一键完成"手段。
+2. **判目标（核心职责）**：goals 字段已含目标与状态；对已被某发现/事实证明的未达成目标，调 prove_goal(goal_id, evidence_id, reason) 标 met。**当你标记的恰是最后一个未完成目标时，系统自动判定整个任务完成**——收官只由逐个 prove_goal 驱动，没有别的"一键完成"手段。证据必须正向支持目标：例如“获取 flag”只能使用实际包含明确 flag 加花括号内容的事实/漏洞证据；“flag 0 / 未发现 flag / 权限被封死 / 提权失败”只能说明该方向未成功，绝不能证明获取 flag 的目标达成。blocked、exhausted、stopped 也都表示执行未完成，必须结合 trace 重新规划，不能当作成功结果。
    - ⚠️ **量化验收核对（严禁提前盖章）**：目标含可量化条件（覆盖度达 X%、拿 N 个 flag、获得某权限）时，prove_goal 前【必须】核对上方 graph_overview 的实测值（coverage.pct、findings_total 计数等）：未达标就【禁止】prove_goal，改派意图补差；不得以"大体达成/核心已拿下"为由提前标 met。例：要求覆盖度 100% 而实测 coverage.pct=40% → 未达成，继续派补测意图。
 
 3. **（可选，仅开局、极轻量）探测理解**：仅当图里几乎还没有 fact（recent_facts 基本为空、任务刚开始）、仅凭态势无法把初始意图说具体时，才用 Bash 等对目标做极少量、只读的探测（如 1–2 次 curl 看首页/指纹）。**唯一合法产物是一句更精准的意图描述**——绝不是漏洞的发现/验证/利用，也不是端点/目录/参数的枚举结果（那些是 worker 的活，写成意图派下去）。三条硬边界：
@@ -345,9 +345,14 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
+// 收尾规则始终追加到自定义提示词后，已有数据库配置也能获得更新。
+const plannerProofPolicy = `
+
+**代码强制的收尾约束**：调用 prove_goal 前必须确认 evidence 节点是已确认的事实/漏洞，并且内容直接支持该目标。获取/找到/提取 flag 的目标必须有实际取得的非占位 flag{...} 输出；新事实用 captured_flag 和 observed_output 分别记录原值与实际输出，旧事实或漏洞的 evidence 也必须包含实际成功输出。README/格式示例、推测值、权限受限、未发现 flag、flag 0、命令参数中的 flag 都不能证明已取得。若同一事实记载先前失败和之后成功，应明确分开并以实际成功输出为准。blocked、exhausted、stopped 都是未完成执行，不能据此把目标或任务判为成功；若目标未完成，应继续规划或等待真实执行结果。`
+
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + artifactSpec(workDir)
+	return body + plannerProofPolicy + artifactSpec(workDir)
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution

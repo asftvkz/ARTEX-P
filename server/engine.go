@@ -929,8 +929,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				if won, err := e.m.completeTaskIfIdle(t.ID); err != nil {
 					log.Printf("[goalless] task %s 收尾落 done 失败: %v", t.ID, err)
 				} else if won {
+					summary := "目标已全部达成，直投意图已执行完毕，任务结束"
+					failed := t.lifecycleSnapshot().Status == "failed"
+					if failed {
+						summary = "目标未完成，且存在未成功意图；任务已标记失败"
+					}
 					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
-						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
+						Summary: summary, IsError: failed})
 				}
 			}
 			return // goalless 分支永不进入 planner.Plan

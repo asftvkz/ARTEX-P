@@ -59,10 +59,7 @@ func TestExplorationFlow(t *testing.T) {
 	if err := es.Link(i2, "yields", find); err != nil {
 		t.Fatal(err)
 	}
-	if err := es.Link(find, "proves", goal); err != nil {
-		t.Fatal(err)
-	}
-	if err := es.SetNodeState(goal, "met"); err != nil {
+	if err := es.ProveGoal(find, goal); err != nil {
 		t.Fatal(err)
 	}
 

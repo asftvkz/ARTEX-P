@@ -297,11 +297,77 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, re
 	return err
 }
 
+// ProveGoal 在同一事务内写证明关系和目标达成状态。
+// 证据允许来自直接关联任务，目标和证明关系仍属于当前探索图。
+func (s *ExplorationStore) ProveGoal(evidenceID, goalID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var root int64
+	if err := tx.QueryRow(`SELECT id FROM explorations WHERE id=$1 FOR NO KEY UPDATE`, s.expID).Scan(&root); err != nil {
+		return err
+	}
+	var goalPayload []byte
+	if err := tx.QueryRow(`SELECT payload FROM exploration_nodes
+WHERE id=$1 AND exploration_id=$2 AND kind='goal' AND state <> 'abandoned' FOR UPDATE`, goalID, s.expID).Scan(&goalPayload); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("目标不存在或不属于本任务")
+		}
+		return err
+	}
+	var evidenceState string
+	var evidencePayload []byte
+	if err := tx.QueryRow(`
+SELECT evidence.state,evidence.payload FROM exploration_nodes evidence
+WHERE evidence.id=$1 AND evidence.kind IN ('fact','finding')
+AND (
+    evidence.exploration_id=$2 OR EXISTS (
+        SELECT 1 FROM task_relations relation
+        JOIN tasks owner ON owner.id=relation.task_id AND owner.deleted_at IS NULL
+        JOIN tasks source ON source.id=relation.source_task_id AND source.deleted_at IS NULL
+        WHERE owner.exploration_id=$2 AND source.exploration_id=evidence.exploration_id
+    )
+)`, evidenceID, s.expID).Scan(&evidenceState, &evidencePayload); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("证明证据不存在或不属于本任务/直接关联任务")
+		}
+		return err
+	}
+	if evidenceState != "confirmed" {
+		return fmt.Errorf("证明证据未被确认为有效事实")
+	}
+	if !GoalProofEvidenceValid(goalPayload, evidencePayload) {
+		return fmt.Errorf("目标证据未满足证明要求")
+	}
+	if _, err := tx.Exec(`
+INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
+ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, evidenceID, RelProves, goalID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE exploration_nodes SET state='met', blocked_reason=NULL, content_version=content_version+1 WHERE id=$1 AND exploration_id=$2 AND kind='goal'`, goalID, s.expID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // SetNodeState updates any node's state (never deletes). content_version bumps
 // so a folded member's state flip invalidates its digest's cached body (§5.3).
 func (s *ExplorationStore) SetNodeState(id int64, state string) error {
-	_, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var root int64
+	if err := tx.QueryRow(`SELECT id FROM explorations WHERE id=$1 FOR NO KEY UPDATE`, s.expID).Scan(&root); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateGoalPayload rewrites a goal node's payload text (and optional vulnclass);
@@ -358,14 +424,29 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
 // The worker resumes from its prior LLM transcript instead of restarting from scratch.
 // done/open/running are left untouched. Returns whether a row changed. Used by "重跑".
 func (s *ExplorationStore) ReopenIntent(id int64) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var root int64
+	if err := tx.QueryRow(`SELECT id FROM explorations WHERE id=$1 FOR NO KEY UPDATE`, s.expID).Scan(&root); err != nil {
+		return false, err
+	}
+	res, err := tx.Exec(`UPDATE exploration_nodes
 SET state='open', completed_at=NULL, blocked_reason=NULL
 WHERE id=$1 AND exploration_id=$2 AND kind='intent'
   AND state IN ('blocked','exhausted','stopped')`, id, s.expID)
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	return n > 0, nil
 }
 
@@ -373,12 +454,27 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 // (batch rerun after e.g. an LLM/network outage that blocked many at once). Returns the
 // number reopened. Workers resume from their transcripts; kept graph writes remain.
 func (s *ExplorationStore) ReopenBlockedIntents() (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var root int64
+	if err := tx.QueryRow(`SELECT id FROM explorations WHERE id=$1 FOR NO KEY UPDATE`, s.expID).Scan(&root); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
 WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
@@ -1208,12 +1304,36 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 
 // ClaimIntent atomically moves an open intent to running. Returns true if claimed.
 func (s *ExplorationStore) ClaimIntent(id int64, owner string) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var status string
+	var paused, queued bool
+	err = tx.QueryRow(`SELECT status,paused,queued FROM tasks WHERE exploration_id=$1 AND deleted_at IS NULL FOR UPDATE`, s.expID).Scan(&status, &paused, &queued)
+	if err != nil && err != sql.ErrNoRows {
+		return false, err
+	}
+	if err == nil && (IsTerminal(status) || paused || queued) {
+		return false, nil
+	}
+	var root int64
+	if err := tx.QueryRow(`SELECT id FROM explorations WHERE id=$1 FOR NO KEY UPDATE`, s.expID).Scan(&root); err != nil {
+		return false, err
+	}
+	res, err := tx.Exec(`UPDATE exploration_nodes SET state='running', owner=$1
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id, s.expID)
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	return n == 1, nil
 }
 
