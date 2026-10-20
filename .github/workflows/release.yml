@@ -42,7 +42,7 @@ jobs:
       - name: Test update download, verification and rollback
         run: |
           timeout 60s go test ./selfupdate ./config -count=1 -timeout 60s
-          timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateStatus|TestWorkspaceProtects)' -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateOffer|TestUpdateStatus|TestWorkspaceProtects)' -count=1 -timeout 60s
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
