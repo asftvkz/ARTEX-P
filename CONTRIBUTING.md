@@ -6,7 +6,7 @@
 
 从最新 `origin/dev` 创建专属功能分支，完成验证后向 dev 提 PR。合并前重新获取远端目标分支，处理过期基线与冲突，再运行受影响的验证。
 
-dev 的每次推送触发 CI 和 `dev-build`。构建产物为 Actions artifact `dev-linux-amd64-<完整SHA>`，包含 zip、SHA256SUMS 和 SOURCE.json。候选程序带 `dev-<12位SHA>` 版本。将正式 Release 更新中心用于稳定版本；dev 候选从对应构建下载，由协调者进行受控部署。
+dev 的每次推送触发 CI 和 `dev-build`。构建产物为 Actions artifact `dev-linux-amd64-<完整SHA>`，包含 zip、SHA256SUMS 和 SOURCE.json。候选程序带 `dev-<12位SHA>` 版本。dev 候选从对应构建下载，由协调者进行受控部署；候选上线后可在页面显式切换到最新正式 Release，无需手工更换程序。候选与正式版无法比较先后，切换前应核对更新日志；页面不自动安装其他 dev 候选。
 
 ## 先部署指定 dev 提交
 

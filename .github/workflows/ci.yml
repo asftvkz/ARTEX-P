@@ -113,7 +113,7 @@ jobs:
       - name: 更新和生命周期定向回归
         run: |
           timeout 60s go test ./selfupdate ./config ./cmd/artex -count=1 -timeout 60s
-          timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateStatus|TestWorkspaceProtects|TestPauseCancelsWithNamedCause|TestResumeYieldsFreshContext|TestResumeDoesNotClearDeleteBarrier)' -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateOffer|TestUpdateStatus|TestWorkspaceProtects|TestPauseCancelsWithNamedCause|TestResumeYieldsFreshContext|TestResumeDoesNotClearDeleteBarrier)' -count=1 -timeout 60s
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

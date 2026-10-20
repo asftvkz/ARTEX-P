@@ -20,14 +20,18 @@ import { api } from "@/lib/api";
  */
 export function UpdateBadge() {
   const [latest, setLatest] = React.useState("");
+  const [releaseSwitch, setReleaseSwitch] = React.useState(false);
 
   React.useEffect(() => {
     let alive = true;
     api
       .checkUpdate()
       .then((r) => {
-        // has_update 已经包含了"版本号可比较"的判断，开发构建不会亮这个提示。
-        if (alive && r.has_update && r.latest) setLatest(r.latest.replace(/^v(?=\d)/, ""));
+        // 是否可升级或切换正式版统一由后端判断。
+        if (alive && r.has_update && r.latest) {
+          setLatest(r.latest.replace(/^v(?=\d)/, ""));
+          setReleaseSwitch(r.release_switch === true);
+        }
       })
       .catch(() => {
         // 静默：没网 / GitHub 限流都不该在顶栏弹错误。
@@ -42,7 +46,7 @@ export function UpdateBadge() {
   return (
     <Link
       href="/system/settings"
-      title={`发现新版本 ${latest}，点击前往更新`}
+      title={`${releaseSwitch ? "可切换正式版" : "发现新版本"} ${latest}，点击前往更新`}
       className="inline-flex items-center gap-1.5 rounded-full bg-primary px-2.5 py-1 font-medium text-primary-foreground text-xs transition-opacity hover:opacity-90"
     >
       {/* 呼吸点：顶栏元素很多，纯文字容易被忽略，动效让它一眼可见。 */}
@@ -51,8 +55,10 @@ export function UpdateBadge() {
         <span className="relative inline-flex size-1.5 rounded-full bg-primary-foreground" />
       </span>
       <ArrowUpCircleIcon className="size-3.5" />
-      <span className="hidden sm:inline">新版本 {latest}</span>
-      <span className="sm:hidden">新版本</span>
+      <span className="hidden sm:inline">
+        {releaseSwitch ? "正式版" : "新版本"} {latest}
+      </span>
+      <span className="sm:hidden">{releaseSwitch ? "正式版" : "新版本"}</span>
     </Link>
   );
 }

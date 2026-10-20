@@ -65,7 +65,8 @@ export function UpdateCard() {
         setInfo(r);
         if (!quiet) {
           if (r.error) toast.error("检查更新失败：" + r.error);
-          else if (r.has_update) toast.success(`发现新版本 ${r.latest}`);
+          else if (r.has_update)
+            toast.success(r.release_switch ? `可切换到正式版 ${r.latest}` : `发现新版本 ${r.latest}`);
           else if (r.comparable) toast.success("当前已是最新版本");
         }
       })
@@ -287,7 +288,7 @@ export function UpdateCard() {
             }
           >
             <DownloadIcon className="size-4" />
-            {info?.has_update ? `更新到 ${info.latest}` : "立即更新"}
+            {info?.has_update ? `${info.release_switch ? "切换到正式版" : "更新到"} ${info.latest}` : "立即更新"}
           </Button>
           {info?.has_backup && (
             <Button variant="ghost" size="sm" onClick={() => setConfirmation("rollback")} disabled={busy || restarting}>
@@ -312,9 +313,14 @@ export function UpdateCard() {
           <AlertDialogContent>
             <AlertDialogHeader>
               <AlertDialogTitle>
-                {confirmation === "rollback" ? "回滚到上一版本？" : `更新到 ${info?.latest ?? "新版本"}？`}
+                {confirmation === "rollback"
+                  ? "回滚到上一版本？"
+                  : `${info?.release_switch ? "切换到正式版" : "更新到"} ${info?.latest ?? "新版本"}？`}
               </AlertDialogTitle>
               <AlertDialogDescription>
+                {confirmation === "update" && info?.release_switch && (
+                  <>当前为 dev 候选，将切换到正式版。无法比较两者先后，请先核对更新日志。 </>
+                )}
                 {confirmation === "rollback"
                   ? "程序会重启，正在运行的任务会被中断。数据库不会回退，请确认上一版本兼容当前数据。"
                   : info?.mode === "docker"

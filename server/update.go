@@ -273,13 +273,12 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 		out["asset_available"] = false
 	}
 
-	cmp, comparable := selfupdate.CompareVersions(current, latest)
+	available, comparable, releaseSwitch, reason := releaseUpdateOffer(current, rel)
 	out["comparable"] = comparable
-	out["has_update"] = comparable && cmp < 0
-	if !comparable {
-		// 开发构建（dev / git describe 带后缀）没有可比较的版本号。放行只会
-		// 用正式版覆盖掉本地正在调试的二进制，所以直接不给更新。
-		out["reason"] = fmt.Sprintf("当前版本 %q 不是正式发布版本，已禁用一键更新", current)
+	out["has_update"] = available
+	out["release_switch"] = releaseSwitch
+	if reason != "" {
+		out["reason"] = reason
 	}
 	writeJSON(w, 200, out)
 }
@@ -302,13 +301,16 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 502, err.Error())
 		return
 	}
-	cmp, comparable := selfupdate.CompareVersions(current, rel.TagName)
-	if !comparable {
-		writeErr(w, 400, fmt.Sprintf("当前版本 %q 不是正式发布版本，已禁用一键更新", current))
+	available, _, _, reason := releaseUpdateOffer(current, rel)
+	if !available {
+		if reason == "" {
+			reason = fmt.Sprintf("当前已是最新版本 %s", current)
+		}
+		writeErr(w, 400, reason)
 		return
 	}
-	if cmp >= 0 {
-		writeErr(w, 400, fmt.Sprintf("当前已是最新版本 %s", current))
+	if _, ok := rel.FindAsset(selfupdate.AssetName(rel.TagName, runtime.GOOS, runtime.GOARCH)); !ok {
+		writeErr(w, 400, "该正式版本未提供当前平台的发布包")
 		return
 	}
 	if selfupdate.Pending() || !updHub.begin(rel.TagName) {
