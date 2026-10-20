@@ -87,6 +87,11 @@ jobs:
           timeout 60s go test ./server -run '^(TestWorkerPGHardTimeout|TestWorkerModelTimeoutDoesNotReplayIntent)' -count=1 -timeout 60s
           cd norma
           timeout 60s go test ./harness -run '^(TestConsumerStop|TestUnlimited|TestHard|TestSettlementOnToolOverrunsBudget|TestParentCancelStillAbortsNoSettlement)' -count=1 -timeout 60s
+      - name: 目标证明和任务完成门禁回归
+        run: |
+          timeout 60s go test ./db -run '^(TestCompleteTaskIfIdle|TestGoalProof|TestFlagAcquisition|TestPositiveFlag|TestProveGoal)' -count=1 -timeout 60s
+          timeout 60s go test ./agent -run '^(TestProveGoal|TestFlagGoal|TestRenderSystemOverride)' -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestGoallessFailedIntent|TestMetGoalAllows|TestOpenGoalWithFailedIntent|TestInvalidMetFlagGoal|TestFlagEvidenceSchema)' -count=1 -timeout 60s
       - name: 容器退出证明与维护入口回归
         env:
           ARTEX_WARP_HEALTH_TEST_DSN: postgres://artex_test:artex_test@127.0.0.1:5432/artex_warp_container_exit_test?sslmode=disable
@@ -108,7 +113,7 @@ jobs:
       - name: 更新和生命周期定向回归
         run: |
           timeout 60s go test ./selfupdate ./config ./cmd/artex -count=1 -timeout 60s
-          timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateStatus|TestWorkspaceProtects|TestPauseCancelsWithNamedCause|TestResumeYieldsFreshContext|TestResumeDoesNotClearDeleteBarrier)' -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateOffer|TestUpdateStatus|TestWorkspaceProtects|TestPauseCancelsWithNamedCause|TestResumeYieldsFreshContext|TestResumeDoesNotClearDeleteBarrier)' -count=1 -timeout 60s
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

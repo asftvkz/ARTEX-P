@@ -29,7 +29,11 @@ func TestTaskFollowupCompletionRejectsPendingWork(t *testing.T) {
 	}
 	goals, _ := task.Store.ListByKind(db.KindGoal, 100)
 	for _, g := range goals {
-		if err = task.Store.SetNodeState(g.ID, "met"); err != nil {
+		evidenceID, addErr := task.Store.AddNode(db.KindFact, map[string]any{"summary": "新增目标已完成"}, 0, "confirmed", "test", nil)
+		if addErr != nil {
+			t.Fatal(addErr)
+		}
+		if err = task.Store.ProveGoal(evidenceID, g.ID); err != nil {
 			t.Fatal(err)
 		}
 	}

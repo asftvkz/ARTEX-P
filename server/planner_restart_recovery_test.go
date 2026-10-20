@@ -287,13 +287,25 @@ func TestPlannerPGRetryHonorsTaskControl(t *testing.T) {
 				if err := s.m.EnqueueTask(task.ID, "resume"); err != nil {
 					t.Fatal(err)
 				}
-			case "done":
-				if err := s.m.SetTaskStatus(task.ID, "done"); err != nil {
+			case "done", "goalless":
+				// 控制状态回归需要有效证明，不能依靠未验收的 met 标记绕过新门禁。
+				evidenceID, err := restored.Store.AddNode(db.KindFact, map[string]any{"summary": "重启控制状态的合成正向证据"}, 0, "confirmed", "test", nil)
+				if err != nil {
 					t.Fatal(err)
 				}
-			case "goalless":
-				if _, err := s.m.pg.Exec(`UPDATE exploration_nodes SET state='met' WHERE exploration_id=$1 AND kind='goal'`, restored.ExpID); err != nil {
+				goals, err := restored.Store.ListByKind(db.KindGoal, 100)
+				if err != nil {
 					t.Fatal(err)
+				}
+				for _, goal := range goals {
+					if err := restored.Store.ProveGoal(evidenceID, goal.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if state == "done" {
+					if err := s.m.SetTaskStatus(task.ID, "done"); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			ready.Store(true)

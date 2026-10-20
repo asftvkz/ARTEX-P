@@ -1736,8 +1736,9 @@ export interface UpdateCheck {
   asset_available?: boolean;
   size?: number;
   has_update?: boolean;
-  /** 双方版本号是否可比较；开发构建为 false，此时禁用一键更新。 */
+  /** 双方版本号是否可比较；dev 候选不可比较，但允许显式切换正式版。 */
   comparable?: boolean;
+  release_switch?: boolean;
   /** comparable 为 false 时的说明。 */
   reason?: string;
 }
