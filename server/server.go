@@ -1001,6 +1001,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/tools/custom/{key}", s.pgDeleteCustomTool)
 	mux.HandleFunc("POST /api/settings/python/detect", s.pgDetectPython)
 	mux.HandleFunc("POST /api/tools/{key}/reset", s.pgResetTool)
+	// 在线仓库目录：所有内容先预览和校验，再显式安装。
+	mux.HandleFunc("GET /api/catalog/source", s.catalogSourceGet)
+	mux.HandleFunc("PUT /api/catalog/source", s.catalogSourcePut)
+	mux.HandleFunc("GET /api/catalog", s.catalogList)
+	mux.HandleFunc("POST /api/catalog/preview", s.catalogPreview)
+	mux.HandleFunc("POST /api/catalog/install", s.catalogInstall)
+	mux.HandleFunc("GET /api/catalog/download", s.catalogDownload)
+	mux.HandleFunc("POST /api/catalog/rollback", s.catalogRollback)
 	// MCP CRUD
 	mux.HandleFunc("GET /api/mcp", s.pgListMCP)
 	mux.HandleFunc("POST /api/mcp", s.pgSaveMCP)
@@ -1017,6 +1025,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)
 	mux.HandleFunc("POST /api/skills/upload", s.fsUploadSkill)
+	mux.HandleFunc("GET /api/skills/{name}/download", s.fsDownloadSkill)
 	mux.HandleFunc("DELETE /api/skills/{name}", s.fsDeleteSkill)
 	mux.HandleFunc("GET /api/skills/missing", s.fsMissingSkills)   // 未命中(想调但不存在)的 skill 名
 	mux.HandleFunc("GET /api/skills/{name}/usage", s.fsSkillUsage) // 单个 skill 的最近调用

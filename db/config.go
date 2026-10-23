@@ -612,7 +612,10 @@ func (d *DB) AgentBindingCounts() (mcp map[int64]int, skill map[int64]int, tools
 	if err = byID(`SELECT agent_id, count(*) FROM agent_skill_visibility WHERE enabled GROUP BY agent_id`, skill); err != nil {
 		return
 	}
-	rows, e := d.Query(`SELECT elem, count(*) FROM tools, jsonb_array_elements_text(agents) AS elem GROUP BY elem`)
+	// 旧版本可能把空绑定写成 JSON null；异常非数组只影响该工具，不能拖垮全部 Agent 的统计。
+	rows, e := d.Query(`SELECT elem, count(*) FROM tools,
+jsonb_array_elements_text(CASE WHEN jsonb_typeof(agents)='array' THEN agents ELSE '[]'::jsonb END) AS elem
+GROUP BY elem`)
 	if e != nil {
 		err = e
 		return
@@ -853,6 +856,11 @@ func (d *DB) SavePrompt(agentID int64, template, note, by string) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	// 与目录更新共用 Agent 行锁，版本分配与当前提示词切换必须作为一个整体。
+	var lockedID int64
+	if err := tx.QueryRow(`SELECT id FROM agents WHERE id=$1 FOR UPDATE`, agentID).Scan(&lockedID); err != nil {
+		return 0, err
+	}
 	var ver int
 	if err := tx.QueryRow(`SELECT COALESCE(max(version),0)+1 FROM agent_prompts WHERE agent_id=$1`, agentID).Scan(&ver); err != nil {
 		return 0, err

@@ -237,13 +237,17 @@ func (s *Server) pgListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dtos := agentDTOs(ags)
-	// overlay per-agent binding counts (mcp/skill by id, tools by key) — best-effort.
-	if mcp, skill, tools, err := pg.AgentBindingCounts(); err == nil {
-		for i := range dtos {
-			dtos[i].McpCount = mcp[ags[i].ID]
-			dtos[i].SkillCount = skill[ags[i].ID]
-			dtos[i].ToolCount = tools[ags[i].Key]
-		}
+	// 统计失败必须可见，避免把读取错误伪装成所有 Agent 都没有绑定。
+	mcp, skill, tools, err := pg.AgentBindingCounts()
+	if err != nil {
+		log.Printf("[agents] 读取绑定统计失败: %v", err)
+		writeErr(w, http.StatusInternalServerError, "读取 Agent 绑定统计失败")
+		return
+	}
+	for i := range dtos {
+		dtos[i].McpCount = mcp[ags[i].ID]
+		dtos[i].SkillCount = skill[ags[i].ID]
+		dtos[i].ToolCount = tools[ags[i].Key]
 	}
 	writeJSON(w, 200, map[string]any{"agents": dtos})
 }
@@ -1009,7 +1013,7 @@ func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 	}
 	nodes := []skillFileNode{}
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		dirName := e.Name()
@@ -1080,6 +1084,8 @@ func cleanStrs(in []string) []string {
 }
 
 func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
+	skillMutationMu.Lock()
+	defer skillMutationMu.Unlock()
 	var body struct {
 		Name          string   `json:"name"`
 		Description   string   `json:"description"`   // required per agentskills.io spec
@@ -1150,6 +1156,8 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 // fields are left as-is (the whole frontmatter is reconstructed from the
 // parsed values, so the write is a clean replace, not a line-patch).
 func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
+	skillMutationMu.Lock()
+	defer skillMutationMu.Unlock()
 	name := r.PathValue("name")
 	if !validSkillName(name) {
 		writeErr(w, 400, "invalid skill name")
@@ -1297,6 +1305,8 @@ func skillNameFromFrontmatter(md []byte) string {
 // of size/count caps guard against zip bombs. POST ?overwrite=true replaces an
 // existing skill of the same name.
 func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
+	skillMutationMu.Lock()
+	defer skillMutationMu.Unlock()
 	r.Body = http.MaxBytesReader(w, r.Body, maxSkillZipBytes)
 	file, hdr, err := r.FormFile("file")
 	if err != nil {
@@ -1325,7 +1335,7 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 	var skillMD *skillZipEntry
 	for i := range entriesAll {
 		e := &entriesAll[i]
-		if path.Base(e.name) != "SKILL.md" {
+		if e.f.FileInfo().IsDir() || path.Base(e.name) != "SKILL.md" {
 			continue
 		}
 		if skillMD == nil || strings.Count(e.name, "/") < strings.Count(skillMD.name, "/") {
@@ -1372,12 +1382,15 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 	// extract into a temp dir first, then atomically swap in — a bad entry aborts
 	// the whole upload without leaving a half-written skill.
 	_ = os.MkdirAll(s.skillDir, 0o755)
-	tmp, err := os.MkdirTemp(s.skillDir, ".upload-*")
+	tmp, err := newSkillUploadStage(s.skillDir)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	defer os.RemoveAll(tmp) // no-op after a successful rename
+	defer func() {
+		_ = os.RemoveAll(tmp)            // 安装成功后原暂存路径已不存在。
+		_ = os.Remove(filepath.Dir(tmp)) // 仅清理空事务目录，保留已有回滚备份。
+	}()
 
 	var total int64
 	entries := 0
@@ -1405,6 +1418,13 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dst := filepath.Join(tmp, clean)
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(dst, 0o755); err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			continue
+		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -1438,10 +1458,7 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if overwrite {
-		_ = os.RemoveAll(skillPath)
-	}
-	if err := os.Rename(tmp, skillPath); err != nil {
+	if err := replaceSkillDirectory(tmp, skillPath, overwrite); err != nil {
 		writeErr(w, 500, "安装失败："+err.Error())
 		return
 	}
@@ -1460,6 +1477,8 @@ func readZipEntry(f *zip.File) ([]byte, error) {
 }
 
 func (s *Server) fsDeleteSkill(w http.ResponseWriter, r *http.Request) {
+	skillMutationMu.Lock()
+	defer skillMutationMu.Unlock()
 	pg := s.pg(w)
 	if pg == nil {
 		return
@@ -1617,6 +1636,8 @@ func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
+	skillMutationMu.Lock()
+	defer skillMutationMu.Unlock()
 	name := r.PathValue("name")
 	if !validSkillName(name) {
 		writeErr(w, 400, "invalid skill name")
@@ -1653,6 +1674,8 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
+	skillMutationMu.Lock()
+	defer skillMutationMu.Unlock()
 	name := r.PathValue("name")
 	if !validSkillName(name) {
 		writeErr(w, 400, "invalid skill name")
@@ -1683,6 +1706,8 @@ func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fsDeletePath(w http.ResponseWriter, r *http.Request) {
+	skillMutationMu.Lock()
+	defer skillMutationMu.Unlock()
 	name := r.PathValue("name")
 	if !validSkillName(name) {
 		writeErr(w, 400, "invalid skill name")
